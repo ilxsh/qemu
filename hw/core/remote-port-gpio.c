@@ -13,7 +13,9 @@
 #include "qemu/log.h"
 #include "qapi/qmp/qerror.h"
 #include "qapi/error.h"
-#include "hw/qdev.h"
+#include "hw/qdev-core.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "hw/fdt_generic_util.h"
 
@@ -116,9 +118,8 @@ static void rp_gpio_init(Object *obj)
 
     object_property_add_link(obj, "rp-adaptor0", "remote-port",
                              (Object **)&rpms->rp,
-                             qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             qdev_prop_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static Property rp_properties[] = {
@@ -156,7 +157,7 @@ static void rp_gpio_class_init(ObjectClass *oc, void *data)
     rpdc->ops[RP_CMD_interrupt] = rp_gpio_interrupt;
     dc->reset = rp_gpio_reset;
     dc->realize = rp_gpio_realize;
-    dc->props = rp_properties;
+    device_class_set_props(dc, rp_properties);
     fgic->get_irq = rp_fdt_get_irq;
 }
 

@@ -25,9 +25,11 @@
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "qapi/error.h"
-#include "hw/hw.h"
-#include "qom/cpu.h"
+#include "qemu/module.h"
+#include "hw/core/cpu.h"
 #include "hw/fdt_generic_util.h"
+#include "hw/irq.h"
+#include "hw/qdev-properties.h"
 
 #define D(x)
 
@@ -228,7 +230,7 @@ static void xilinx_intc_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     FDTGenericIntcClass *fgic = FDT_GENERIC_INTC_CLASS(klass);
 
-    dc->props = xilinx_intc_properties;
+    device_class_set_props(dc, xilinx_intc_properties);
     fgic->get_irq = xilinx_intc_fdt_get_irq;
     fgic->auto_parent = xilinx_intc_fdt_auto_parent;
 }

@@ -20,6 +20,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 #include "hw/pci/pci_ids.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/pcie.h"
@@ -36,9 +38,12 @@ static void xlnx_write_config(PCIDevice *d,
 {
     uint32_t root_cmd =
         pci_get_long(d->config + d->exp.aer_cap + PCI_ERR_ROOT_COMMAND);
+    uint16_t slt_ctl, slt_sta;
+
+    pcie_cap_slot_get(d, &slt_ctl, &slt_sta);
 
     pci_bridge_write_config(d, address, val, len);
-    pcie_cap_slot_write_config(d, address, val, len);
+    pcie_cap_slot_write_config(d, slt_ctl, slt_sta, address, val, len);
     pcie_aer_write_config(d, address, val, len);
     pcie_aer_root_write_config(d, address, val, len, root_cmd);
 }
@@ -56,47 +61,42 @@ static void xlnx_reset(DeviceState *qdev)
     pci_bridge_disable_base_limit(d);
 }
 
-static int xlnx_initfn(PCIDevice *d)
+static void xlnx_realize(PCIDevice *d, Error **errp)
 {
     PCIEPort *p = PCIE_PORT(d);
     PCIESlot *s = PCIE_SLOT(d);
-    Error *err = NULL;
     int rc;
 
     pci_bridge_initfn(d, TYPE_PCIE_BUS);
     pcie_port_init_reg(d);
 
     rc = pcie_cap_init(d, EP_EXP_OFFSET, PCI_EXP_TYPE_ROOT_PORT, p->port,
-                       &err);
+                       errp);
     if (rc < 0) {
-        error_report_err(err);
         goto err_bridge;
     }
 
     pcie_cap_arifwd_init(d);
     pcie_cap_deverr_init(d);
-    pcie_cap_slot_init(d, s->slot);
+    pcie_cap_slot_init(d, s);
     pcie_chassis_create(s->chassis);
     rc = pcie_chassis_add_slot(s);
     if (rc < 0) {
         goto err_pcie_cap;
     }
     pcie_cap_root_init(d);
-    rc = pcie_aer_init(d, PCI_ERR_VER, EP_AER_OFFSET, PCI_ERR_SIZEOF, &err);
+    rc = pcie_aer_init(d, PCI_ERR_VER, EP_AER_OFFSET, PCI_ERR_SIZEOF, errp);
     if (rc < 0) {
-        error_report_err(err);
         goto err;
     }
 
-    return 0;
-
+    return;
 err:
     pcie_chassis_del_slot(s);
 err_pcie_cap:
     pcie_cap_exit(d);
 err_bridge:
     pci_bridge_exitfn(d);
-    return rc;
 }
 
 static void xlnx_exitfn(PCIDevice *d)
@@ -133,10 +133,9 @@ static void xlnx_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
-    k->is_express = 1;
     k->is_bridge = 1;
     k->config_write = xlnx_write_config;
-    k->init = xlnx_initfn;
+    k->realize = xlnx_realize;
     k->exit = xlnx_exitfn;
     k->vendor_id = PCI_VENDOR_ID_XILINX;
     k->device_id = PCI_DEVICE_ID_EPORT;
@@ -145,7 +144,7 @@ static void xlnx_class_init(ObjectClass *klass, void *data)
     dc->desc = "Xilinx PCIe Root Port";
     dc->reset = xlnx_reset;
     dc->vmsd = &vmstate_xlnx;
-    dc->props = xlnx_props;
+    device_class_set_props(dc, xlnx_props);
 }
 
 static const TypeInfo xlnx_info = {

@@ -25,6 +25,7 @@
 #include "hw/sysbus.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
+#include "hw/qdev-properties.h"
 
 #define TYPE_GPIO_MR_MUX "gpio-mr-mux"
 
@@ -105,10 +106,9 @@ static void gpio_mr_mux_init(Object *obj)
             char *name = g_strdup_printf("mr%d", i);
 
             object_property_add_link(obj, name, TYPE_MEMORY_REGION,
-                    (Object **)&s->mr[i],
-                    qdev_prop_allow_set_link_before_realize,
-                    OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                    &error_abort);
+                             (Object **)&s->mr[i],
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
             g_free(name);
     }
 }
@@ -123,7 +123,7 @@ static void gpio_mr_mux_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = gpio_mr_mux_realize;
-    dc->props = gpio_mr_mux_properties;
+    device_class_set_props(dc, gpio_mr_mux_properties);
 }
 
 static const TypeInfo gpio_mr_mux_info = {

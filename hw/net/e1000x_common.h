@@ -22,6 +22,9 @@
 * License along with this library; if not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifndef HW_NET_E1000X_COMMON_H
+#define HW_NET_E1000X_COMMON_H
+
 #include "e1000_regs.h"
 
 #define defreg(x)   x = (E1000_##x >> 2)
@@ -193,7 +196,6 @@ void e1000x_update_regs_on_autoneg_done(uint32_t *mac, uint16_t *phy);
 void e1000x_increase_size_stats(uint32_t *mac, const int *size_regs, int size);
 
 typedef struct e1000x_txd_props {
-    unsigned char sum_needed;
     uint8_t ipcss;
     uint8_t ipcso;
     uint16_t ipcse;
@@ -206,8 +208,9 @@ typedef struct e1000x_txd_props {
     int8_t ip;
     int8_t tcp;
     bool tse;
-    bool cptse;
 } e1000x_txd_props;
 
 void e1000x_read_tx_ctx_descr(struct e1000_context_desc *d,
                               e1000x_txd_props *props);
+
+#endif

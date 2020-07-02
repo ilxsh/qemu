@@ -22,9 +22,12 @@
 #include "qemu/bitops.h"
 #include "qemu/timer.h"
 #include "hw/sysbus.h"
+#include "hw/irq.h"
 #include "hw/i2c/i2c.h"
 #include "qemu/fifo.h"
 #include "qemu/log.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #define TYPE_CADENCE_I2C                  "cdns.i2c-r1p10"
 #define CADENCE_I2C(obj)                  \
@@ -335,6 +338,7 @@ static void cadence_i2c_write(void *opaque, hwaddr offset,
             i2c_end_transfer(s->bus);
             qemu_log_mask(LOG_GUEST_ERROR,
                           "%s: No match for device 0x%x\n", path, new_value);
+            s->regs[R_ISR] |= ISR_NACK;
             g_free(path);
         } else {
             DB_PRINT("device 0x%x probe success\n", new_value);
@@ -342,6 +346,9 @@ static void cadence_i2c_write(void *opaque, hwaddr offset,
                 /* Set "device found" in slave monitor mode */
                 s->regs[R_ISR] |= ISR_SLV_RDY;
             } else {
+                if (fifo_is_empty(&s->fifo)) {
+                    s->regs[R_ISR] |= ISR_COMP;
+                }
                 s->regs[R_STATUS] |= STATUS_BA;
             }
         }

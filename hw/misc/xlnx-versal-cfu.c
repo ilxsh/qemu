@@ -27,8 +27,11 @@
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "hw/register.h"
+#include "hw/irq.h"
 #include "qemu/bitops.h"
 #include "qemu/log.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 #include "chardev/char.h"
 #include "chardev/char-fe.h"
 
@@ -347,7 +350,7 @@ static void cfu_apb_reset(DeviceState *dev)
 
 static const MemoryRegionOps cfu_apb_ops = {
     .read = register_read_memory,
-    .write = register_write_memory,
+    .write_with_attrs = register_write_memory_with_attrs,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 4,
@@ -471,7 +474,7 @@ static void cfu_apb_class_init(ObjectClass *klass, void *data)
     dc->reset = cfu_apb_reset;
     dc->vmsd = &vmstate_cfu_apb;
     dc->realize = cfu_apb_realize;
-    dc->props = cfu_props;
+    device_class_set_props(dc, cfu_props);
 
 }
 

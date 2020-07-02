@@ -31,12 +31,15 @@
 #include "qapi/qmp/qerror.h"
 #include "sysemu/blockdev.h"
 #include "sysemu/block-backend.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "hw/fdt_generic_util.h"
 
 #include "hw/sd/sd.h"
 #include "hw/sd/sdhci.h"
 #include "qapi/error.h"
+#include "sdhci-internal.h"
 
 #ifndef ZYNQMP_SDHCI_ERR_DEBUG
 #define ZYNQMP_SDHCI_ERR_DEBUG 0
@@ -82,8 +85,14 @@ static void zynqmp_sdhci_slottype_handler(void *opaque, int n, int level)
 static void zynqmp_sdhci_reset(DeviceState *dev)
 {
     DeviceClass *dc_parent = DEVICE_CLASS(ZYNQMP_SDHCI_PARENT_CLASS);
+    ZynqMPSDHCIState *s = ZYNQMP_SDHCI(dev);
+    SDHCIState *p = SYSBUS_SDHCI(dev);
 
     dc_parent->reset(dev);
+    if (s->is_mmc) {
+        p->capareg = deposit64(p->capareg, R_SDHC_CAPAB_SLOT_TYPE_SHIFT,
+                  R_SDHC_CAPAB_SLOT_TYPE_LENGTH, 0x01);
+    }
 }
 
 static void zynqmp_sdhci_realize(DeviceState *dev, Error **errp)
@@ -110,6 +119,8 @@ static void zynqmp_sdhci_realize(DeviceState *dev, Error **errp)
     qdev_prop_set_uint8(dev, "uhs", UHS_I);
     carddev_sd = qdev_create(qdev_get_child_bus(DEVICE(dev), "sd-bus"),
                              TYPE_SD_CARD);
+    object_property_add_child(OBJECT(dev), "sd-card",
+                              OBJECT(carddev_sd));
     object_property_set_bool(OBJECT(carddev_sd), false, "spi", &error_fatal);
 
     /*
@@ -162,7 +173,7 @@ static void zynqmp_sdhci_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = zynqmp_sdhci_realize;
-    dc->props = zynqmp_sdhci_properties;
+    device_class_set_props(dc, zynqmp_sdhci_properties);
     dc->reset = zynqmp_sdhci_reset;
 }
 

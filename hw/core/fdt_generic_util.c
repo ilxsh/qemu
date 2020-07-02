@@ -35,14 +35,18 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/reset.h"
 #include "qemu/cutils.h"
 #include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "chardev/char.h"
 #include "qemu/log.h"
 #include "qemu/config-file.h"
-#include "qom/cpu.h"
 #include "block/block.h"
 #include "hw/ssi/ssi.h"
+#include "hw/boards.h"
+#include "qemu/option.h"
+#include "hw/qdev-properties.h"
 
 #ifndef FDT_GENERIC_UTIL_ERR_DEBUG
 #define FDT_GENERIC_UTIL_ERR_DEBUG 3
@@ -156,7 +160,7 @@ static void fdt_init_all_irqs(FDTMachineInfo *fdti)
                     }
 
                     object_property_add_child(OBJECT(irq->dev), shared_irq_name,
-                                              OBJECT(*sources), &error_abort);
+                                              OBJECT(*sources));
                     g_free(shared_irq_name);
                     irq->irq = *(sources++);
                     s->num++;
@@ -175,10 +179,19 @@ static void fdt_init_all_irqs(FDTMachineInfo *fdti)
     }
 }
 
+static void fdt_init_cpu_clusters(FDTMachineInfo *fdti)
+{
+	FDTCPUCluster *cl = fdti->clusters;
+
+	while (cl) {
+		qdev_init_nofail(DEVICE(cl->cpu_cluster));
+		cl = cl->next;
+	}
+}
+
 FDTMachineInfo *fdt_generic_create_machine(void *fdt, qemu_irq *cpu_irq)
 {
     char node_path[DT_PATH_LENGTH];
-    QemuOpts *opts = qemu_opts_find(qemu_find_opts("smp-opts"), NULL);
     FDTMachineInfo *fdti = fdt_init_new_fdti(fdt);
 
     fdti->irq_base = cpu_irq;
@@ -190,7 +203,8 @@ FDTMachineInfo *fdt_generic_create_machine(void *fdt, qemu_irq *cpu_irq)
         memory_region_transaction_begin();
         fdt_init_set_opaque(fdti, node_path, NULL);
         simple_bus_fdt_init(node_path, fdti);
-        while (qemu_co_enter_next(fdti->cq));
+        while (qemu_co_enter_next(fdti->cq, NULL));
+        fdt_init_cpu_clusters(fdti);
         fdt_init_all_irqs(fdti);
         memory_region_transaction_commit();
     } else {
@@ -198,16 +212,13 @@ FDTMachineInfo *fdt_generic_create_machine(void *fdt, qemu_irq *cpu_irq)
             , node_path);
     }
 
+    /* FIXME: Populate these from DTS and create CPU clusters.  */
+    current_machine->smp.cores = fdt_generic_num_cpus;
+    current_machine->smp.cpus = fdt_generic_num_cpus;
+    current_machine->smp.max_cpus = fdt_generic_num_cpus;
+
     bdrv_drain_all();
     DB_PRINT(0, "FDT: Device tree scan complete\n");
-
-    /* Set the number of CPUs */
-    if (!qemu_opt_get_number(opts, "cpus", 0)) {
-        smp_cpus = fdt_generic_num_cpus;
-    }
-
-    DB_PRINT(0, "The value of smp_cpus is: %d\n", smp_cpus);
-
     return fdti;
 }
 
@@ -219,6 +230,15 @@ struct FDTInitNodeArgs {
 
 static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat);
 
+static int check_compat(const char *prefix, const char *compat,
+                        char *node_path, FDTMachineInfo *fdti)
+{
+    char *compat_prefixed = g_strconcat(prefix, compat, NULL);
+    const int done = !fdt_init_compat(node_path, fdti, compat_prefixed);
+    g_free(compat_prefixed);
+    return done;
+}
+
 static void fdt_init_node(void *args)
 {
     struct FDTInitNodeArgs *a = args;
@@ -228,7 +248,7 @@ static void fdt_init_node(void *args)
 
     simple_bus_fdt_init(node_path, fdti);
 
-    char *all_compats = NULL, *compat, *node_name, *next_compat;
+    char *all_compats = NULL, *node_name;
     char *device_type = NULL;
     int compat_len;
 
@@ -248,47 +268,55 @@ static void fdt_init_node(void *args)
     /* fallback to compatibility binding */
     all_compats = qemu_fdt_getprop(fdti->fdt, node_path, "compatible",
                                    &compat_len, false, NULL);
-    if (!all_compats) {
+    if (all_compats) {
+        char *compat = all_compats;
+        char * const end = &all_compats[compat_len - 1]; /* points to nul */
+
+        while (compat < end) {
+            if (check_compat("compatible:", compat, node_path, fdti)) {
+                goto exit;
+            }
+
+            if (!fdt_init_qdev(node_path, fdti, compat)) {
+                goto exit;
+            }
+
+            /* Scan forward to the end of the current compat. */
+            while (compat < end && *compat) {
+                ++compat;
+            }
+
+            /* Replace nul with space for the debug printf below. */
+            if (compat < end) {
+                *compat++ = ' ';
+            }
+        };
+    } else {
         DB_PRINT_NP(0, "no compatibility found\n");
-    }
-
-    for (compat = all_compats; compat && compat_len; compat = next_compat+1) {
-        char *compat_prefixed = g_strdup_printf("compatible:%s", compat);
-        if (!fdt_init_compat(node_path, fdti, compat_prefixed)) {
-            goto exit;
-        }
-        g_free(compat_prefixed);
-        if (!fdt_init_qdev(node_path, fdti, compat)) {
-            goto exit;
-        }
-        next_compat = memchr(compat, '\0', DT_PATH_LENGTH);
-        compat_len -= (next_compat + 1 - compat);
-        if (compat_len > 0) {
-            *next_compat = ' ';
-        }
-    }
-
-    device_type = qemu_fdt_getprop(fdti->fdt, node_path,
-                                   "device_type", NULL, false, NULL);
-    device_type = g_strdup_printf("device_type:%s", device_type);
-    if (!fdt_init_compat(node_path, fdti, device_type)) {
-        goto exit;
     }
 
     /* Try to create the device using device_type property
      * Not every device tree node has compatible  property, so
      * try with device_type.
      */
-    if (!fdt_init_qdev(node_path, fdti, device_type)) {
-        goto exit;
+    device_type = qemu_fdt_getprop(fdti->fdt, node_path,
+                                   "device_type", NULL, false, NULL);
+    if (device_type) {
+        if (check_compat("device_type:", device_type, node_path, fdti)) {
+            goto exit;
+        }
+
+        if (!fdt_init_qdev(node_path, fdti, device_type)) {
+            goto exit;
+        }
     }
 
-    if (!all_compats) {
-        goto exit;
+    if (all_compats) {
+        DB_PRINT_NP(0, "FDT: Unsupported peripheral invalidated - "
+                    "compatibilities %s\n", all_compats);
+        qemu_fdt_setprop_string(fdti->fdt, node_path, "compatible",
+                                "invalidated");
     }
-    DB_PRINT_NP(0, "FDT: Unsupported peripheral invalidated - "
-                "compatibilities %s\n", all_compats);
-    qemu_fdt_setprop_string(fdti->fdt, node_path, "compatible", "invalidated");
 exit:
 
     DB_PRINT_NP(1, "exit\n");
@@ -804,6 +832,103 @@ static inline const char *trim_vendor(const char *s)
     return ret ? ret + 1 : s;
 }
 
+/*
+ * Try to attach by matching drive created by '-blockdev node-name=LABEL'
+ * iff the FDT node contains property 'blockdev-node-name=LABEL'.
+ *
+ * Return false unless the given node_path has the property.
+ *
+ * Presence of the property also disables the node from ever attached
+ * to any drive created by the legacy '-drive' QEMU option.
+ *
+ * For more on '-blockdev', see:
+ *   http://events17.linuxfoundation.org/sites/events/files/slides/talk_11.pdf
+ */
+static bool fdt_attach_blockdev(FDTMachineInfo *fdti,
+                                char *node_path, Object *dev)
+{
+    static const char propname[] = "blockdev-node-name";
+    BlockBackend *bdev = NULL;
+    char *label;
+
+    /* Inspect FDT node for blockdev-only binding */
+    label = qemu_fdt_getprop(fdti->fdt, node_path, propname,
+                             NULL, false, NULL);
+
+    /* Skip legacy node */
+    if (!label) {
+        return false;
+    }
+
+    /*
+     * Missing matching bdev is not an error: attachment is optional.
+     *
+     * error_setg() aborts, never returns: 'goto ret' is just sanity.
+     */
+    if (!label[0]) {
+        error_setg(&error_abort, "FDT-node '%s': property '%s' = <empty>",
+                   node_path, propname);
+        goto ret;
+    }
+
+    bdev = blk_by_name(label);
+    if (!bdev) {
+        goto ret;
+    }
+
+    if (blk_legacy_dinfo(bdev)) {
+        error_setg(&error_abort,
+                   "FDT-node '%s': property '%s' = \"%s\" matched to"
+                   " a '-drive' option. Must use -blockdev instead.",
+                   node_path, propname, label);
+        goto ret;
+    }
+
+    qdev_prop_set_drive(DEVICE(dev), "drive", bdev, &error_abort);
+
+ ret:
+    g_free(label);
+    return true;
+}
+
+static void fdt_attach_drive(FDTMachineInfo *fdti, char *node_path,
+                             Object *dev, BlockInterfaceType drive_type)
+{
+    DriveInfo *dinfo = NULL;
+    uint32_t *di_val = NULL;
+    int di_len = 0;
+
+    /* Do nothing if the device is not a block front-end */
+    if (!object_property_find(OBJECT(dev), "drive", NULL)) {
+        return;
+    }
+
+    /* Try non-legacy */
+    if (fdt_attach_blockdev(fdti, node_path, dev)) {
+        return;
+    }
+
+    /*
+     * Try legacy with explicit 'drive-index' binding, or next-unit
+     * as fallback binding.
+     */
+    di_val = qemu_fdt_getprop(fdti->fdt, node_path, "drive-index",
+                              &di_len, false, NULL);
+
+    if (di_val && (di_len == sizeof(*di_val))) {
+        dinfo = drive_get_by_index(drive_type, be32_to_cpu(*di_val));
+    } else {
+        dinfo = drive_get_next(drive_type);
+    }
+
+    if (dinfo) {
+        qdev_prop_set_drive(DEVICE(dev), "drive",
+                            blk_by_legacy_dinfo(dinfo), &error_abort);
+    }
+
+    return;
+}
+
 static Object *fdt_create_from_compat(const char *compat, char **dev_type)
 {
     Object *ret = NULL;
@@ -914,6 +1039,43 @@ static void fdt_dev_error(FDTMachineInfo *fdti, char *node_path, char *compat)
     }
 }
 
+static void fdt_init_qdev_array_prop(Object *obj, QEMUDevtreeProp *prop)
+{
+    const char *propname = prop->name;
+    const uint32_t *v32 = prop->value;
+    int nr = prop->len;
+    Error *local_err = NULL;
+    char *len_name;
+
+    if (!v32 || !nr || (nr % 4)) {
+        return;
+    }
+    nr /= 4;
+
+    /*
+     * Fail gracefully on setting the 'len-' property, due to:
+     * 1. The property does not exist, or
+     * 2. The property is not integer type, or
+     * 3. The property has been set, e.g., by the '-global' cmd option
+     */
+    len_name = g_strconcat(PROP_ARRAY_LEN_PREFIX, propname, NULL);
+    object_property_set_int(obj, nr, len_name, &local_err);
+    g_free(len_name);
+
+    if (local_err) {
+        error_free(local_err);
+        return;
+    }
+
+    while (nr--) {
+        char *elem_name = g_strdup_printf("%s[%d]", propname, nr);
+
+        object_property_set_int(obj, get_int_be(&v32[nr], 4), elem_name,
+                                &error_abort);
+        g_free(elem_name);
+    }
+}
+
 static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat)
 {
     Object *dev, *parent;
@@ -949,14 +1111,18 @@ static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat)
     while (!fdt_init_has_opaque(fdti, parent_node_path)) {
         fdt_init_yield(fdti);
     }
-    parent = fdt_init_get_opaque(fdti, parent_node_path);
+    if (object_dynamic_cast(dev, TYPE_CPU)) {
+	parent = fdt_init_get_cpu_cluster(fdti, compat);
+    } else {
+        parent = fdt_init_get_opaque(fdti, parent_node_path);
+    }
     if (dev->parent) {
         DB_PRINT_NP(0, "Node already parented - skipping node\n");
     } else if (parent) {
         DB_PRINT_NP(1, "parenting node\n");
         object_property_add_child(OBJECT(parent),
                               qemu_devtree_get_node_name(fdti->fdt, node_path),
-                              OBJECT(dev), NULL);
+                              OBJECT(dev));
         if (object_dynamic_cast(dev, TYPE_DEVICE)) {
             Object *parent_bus = parent;
             unsigned int depth = 0;
@@ -994,7 +1160,7 @@ static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat)
         object_property_add_child(
                               object_get_root(),
                               qemu_devtree_get_node_name(fdti->fdt, node_path),
-                              OBJECT(dev), NULL);
+                              OBJECT(dev));
     }
     fdt_init_set_opaque(fdti, node_path, dev);
 
@@ -1010,18 +1176,42 @@ static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat)
         }
     }
 
+    /* Call FDT Generic hooks for overriding prop default values.  */
+    if (object_dynamic_cast(dev, TYPE_FDT_GENERIC_PROPS)) {
+        FDTGenericPropsClass *k = FDT_GENERIC_PROPS_GET_CLASS(dev);
+
+        assert(k->set_props);
+        k->set_props(OBJECT(dev), &error_fatal);
+    }
+
     props = qemu_devtree_get_props(fdti->fdt, node_path);
     for (prop = props; prop->name; prop++) {
         const char *propname = trim_vendor(prop->name);
         int len = prop->len;
         void *val = prop->value;
-
-        ObjectProperty *p = object_property_find(OBJECT(dev), propname, NULL);
+        ObjectProperty *p = NULL;
+#ifdef _WIN32
+        QEMUDevtreeProp *wp;
+        char *winPropname = g_strdup_printf("windows-%s", propname);
+        wp = qemu_devtree_prop_search(props, winPropname);
+        if (wp) {
+            g_free(prop->value);
+            prop->len = wp->len;
+            prop->value = g_memdup(wp->value, wp->len);
+            val = prop->value;
+            len = prop->len;
+            DB_PRINT_NP(1, "Found windows property match: %s\n",
+                        winPropname);
+        }
+        g_free(winPropname);
+#endif
+        p = object_property_find(OBJECT(dev), propname, NULL);
         if (p) {
             DB_PRINT_NP(1, "matched property: %s of type %s, len %d\n",
                                             propname, p->type, prop->len);
         }
         if (!p) {
+            fdt_init_qdev_array_prop(dev, prop);
             continue;
         }
 
@@ -1142,6 +1332,9 @@ static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat)
                 DB_PRINT_NP(1, "cant get node from phandle\n");
                 break;
             }
+            while (!fdt_init_has_opaque(fdti, adaptor_node_path)) {
+                fdt_init_yield(fdti);
+            }
             adaptor = DEVICE(fdt_init_get_opaque(fdti, adaptor_node_path));
             name = g_strdup_printf("rp-adaptor%" PRId32, i);
             object_property_set_link(OBJECT(dev), OBJECT(adaptor), name, &errp);
@@ -1204,8 +1397,8 @@ static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat)
          */
         if (!object_dynamic_cast(dev, TYPE_REMOTE_PORT)) {
             /* Connect chardev if we can */
-            if (fdt_serial_ports < MAX_SERIAL_PORTS && serial_hds[fdt_serial_ports]) {
-                Chardev *value = (Chardev*) serial_hds[fdt_serial_ports];
+            if (fdt_serial_ports < serial_max_hds() && serial_hd(fdt_serial_ports)) {
+                Chardev *value = (Chardev*) serial_hd(fdt_serial_ports);
                 char *chardev;
 
                 /* Check if the device already has a chardev.  */
@@ -1223,19 +1416,10 @@ static int fdt_init_qdev(char *node_path, FDTMachineInfo *fdti, char *compat)
         }
 
         /* We also need to externally connect drives. Let's try to do that
-         * here. Don't use drive_get_next() as it always increments the
-         * next_block_unit variable.
+         * here.
          */
         if (object_dynamic_cast(dev, TYPE_SSI_SLAVE)) {
-            object_property_find(OBJECT(dev), "drive", &errp);
-            if (errp == NULL) {
-                DriveInfo *dinfo = drive_get_next(IF_MTD);
-                if (dinfo) {
-                    qdev_prop_set_drive(DEVICE(dev), "drive",
-                                    blk_by_legacy_dinfo(dinfo), &error_abort);
-                 }
-             }
-             errp = NULL;
+            fdt_attach_drive(fdti, node_path, dev, IF_MTD);
         }
 
         /* Regular TYPE_DEVICE houskeeping */
@@ -1356,6 +1540,15 @@ exit_reg_parse:
                                         dev, TYPE_FDT_GENERIC_INTC);
                 FDTGenericIntcClass *idc = FDT_GENERIC_INTC_GET_CLASS(id);
                 if (id && idc->auto_parent) {
+                    /*
+                     * Hack alert! auto-parenting the interrupt
+                     * controller before the first CPU has been
+                     * realized leads to a segmentation fault in
+                     * xilinx_intc_fdt_auto_parent.
+                     */
+                    while (!DEVICE(first_cpu)) {
+                        fdt_init_yield(fdti);
+                    }
                     Error *err = NULL;
                     idc->auto_parent(id, &err);
                 } else {
@@ -1481,11 +1674,18 @@ static const TypeInfo fdt_generic_gpio_info = {
     .class_size = sizeof(FDTGenericGPIOClass),
 };
 
+static const TypeInfo fdt_generic_props_info = {
+    .name          = TYPE_FDT_GENERIC_PROPS,
+    .parent        = TYPE_INTERFACE,
+    .class_size = sizeof(FDTGenericPropsClass),
+};
+
 static void fdt_generic_intc_register_types(void)
 {
     type_register_static(&fdt_generic_intc_info);
     type_register_static(&fdt_generic_mmap_info);
     type_register_static(&fdt_generic_gpio_info);
+    type_register_static(&fdt_generic_props_info);
 }
 
 type_init(fdt_generic_intc_register_types)

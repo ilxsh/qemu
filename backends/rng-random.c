@@ -16,6 +16,7 @@
 #include "qapi/error.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/main-loop.h"
+#include "qemu/module.h"
 
 struct RngRandom
 {
@@ -109,10 +110,9 @@ static void rng_random_init(Object *obj)
 
     object_property_add_str(obj, "filename",
                             rng_random_get_filename,
-                            rng_random_set_filename,
-                            NULL);
+                            rng_random_set_filename);
 
-    s->filename = g_strdup("/dev/random");
+    s->filename = g_strdup("/dev/urandom");
     s->fd = -1;
 }
 

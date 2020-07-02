@@ -27,10 +27,13 @@
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "hw/register.h"
+#include "hw/irq.h"
 #include "qemu/timer.h"
 #include "qemu/bitops.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "qapi/qmp/qerror.h"
 
@@ -316,7 +319,7 @@ static void swdt_class_init(ObjectClass *klass, void *data)
     dc->reset = swdt_reset;
     dc->realize = swdt_realize;
     dc->vmsd = &vmstate_swdt;
-    dc->props = swdt_properties;
+    device_class_set_props(dc, swdt_properties);
 }
 
 static const TypeInfo swdt_info = {

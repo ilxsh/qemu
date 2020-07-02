@@ -9,8 +9,9 @@
  * This work is licensed under the terms of the GNU GPL version 2.
  * See the COPYING file in the top-level directory.
  */
+
 #include "qemu/osdep.h"
-#include "qemu-common.h"
+#include "qemu/module.h"
 #include "cpu.h"
 #include "hw/i386/apic_internal.h"
 #include "hw/pci/msi.h"
@@ -229,7 +230,7 @@ static void kvm_apic_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static void kvm_apic_unrealize(DeviceState *dev, Error **errp)
+static void kvm_apic_unrealize(DeviceState *dev)
 {
 }
 

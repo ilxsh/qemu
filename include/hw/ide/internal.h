@@ -6,13 +6,14 @@
  * only files in hw/ide/ are supposed to include this file.
  * non-internal declarations are in hw/ide.h
  */
+
+#include "qapi/qapi-types-run-state.h"
 #include "hw/ide.h"
+#include "hw/irq.h"
 #include "hw/isa/isa.h"
 #include "sysemu/dma.h"
-#include "sysemu/sysemu.h"
 #include "hw/block/block.h"
 #include "scsi/constants.h"
-#include "qapi/error.h"
 
 /* debug IDE devices */
 #define USE_DMA_CDROM
@@ -25,6 +26,8 @@ typedef struct IDEDMAOps IDEDMAOps;
 
 #define TYPE_IDE_BUS "IDE"
 #define IDE_BUS(obj) OBJECT_CHECK(IDEBus, (obj), TYPE_IDE_BUS)
+
+#define MAX_IDE_DEVS 2
 
 /* Bits of HD_STATUS */
 #define ERR_STAT		0x01
@@ -321,11 +324,10 @@ typedef void EndTransferFunc(IDEState *);
 
 typedef void DMAStartFunc(IDEDMA *, IDEState *, BlockCompletionFunc *);
 typedef void DMAVoidFunc(IDEDMA *);
-typedef int DMAIntFunc(IDEDMA *, int);
+typedef int DMAIntFunc(IDEDMA *, bool);
 typedef int32_t DMAInt32Func(IDEDMA *, int32_t len);
 typedef void DMAu32Func(IDEDMA *, uint32_t);
 typedef void DMAStopFunc(IDEDMA *, bool);
-typedef void DMARestartFunc(void *, int, RunState);
 
 struct unreported_events {
     bool eject_request;
@@ -343,11 +345,10 @@ enum ide_dma_cmd {
 extern const char *IDE_DMA_CMD_lookup[IDE_DMA__COUNT];
 
 #define ide_cmd_is_read(s) \
-	((s)->dma_cmd == IDE_DMA_READ)
+        ((s)->dma_cmd == IDE_DMA_READ)
 
 typedef struct IDEBufferedRequest {
     QLIST_ENTRY(IDEBufferedRequest) list;
-    struct iovec iov;
     QEMUIOVector qiov;
     QEMUIOVector *original_qiov;
     BlockCompletionFunc *original_cb;
@@ -406,7 +407,6 @@ struct IDEState {
     int atapi_dma; /* true if dma is requested for the packet cmd */
     BlockAcctCookie acct;
     BlockAIOCB *pio_aiocb;
-    struct iovec iov;
     QEMUIOVector qiov;
     QLIST_HEAD(, IDEBufferedRequest) buffered_requests;
     /* ATA DMA state */
@@ -445,7 +445,7 @@ struct IDEState {
 
 struct IDEDMAOps {
     DMAStartFunc *start_dma;
-    DMAVoidFunc *start_transfer;
+    DMAVoidFunc *pio_transfer;
     DMAInt32Func *prepare_buf;
     DMAu32Func *commit_buf;
     DMAIntFunc *rw_buf;
@@ -458,7 +458,6 @@ struct IDEDMAOps {
 
 struct IDEDMA {
     const struct IDEDMAOps *ops;
-    struct iovec iov;
     QEMUIOVector qiov;
     BlockAIOCB *aiocb;
 };
@@ -624,6 +623,8 @@ void ide_exec_cmd(IDEBus *bus, uint32_t val);
 
 void ide_transfer_start(IDEState *s, uint8_t *buf, int size,
                         EndTransferFunc *end_transfer_func);
+bool ide_transfer_start_norecurse(IDEState *s, uint8_t *buf, int size,
+                                  EndTransferFunc *end_transfer_func);
 void ide_transfer_stop(IDEState *s);
 void ide_set_inactive(IDEState *s, bool more);
 BlockAIOCB *ide_issue_trim(

@@ -25,10 +25,16 @@
 #include "qemu/osdep.h"
 #include <zlib.h> /* For crc32 */
 
+#include "hw/irq.h"
 #include "hw/net/cadence_gem.h"
+#include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
+#include "qemu/module.h"
+#include "sysemu/dma.h"
 #include "net/checksum.h"
+#include "net/eth.h"
 #include "exec/address-spaces.h"
 
 #define CADENCE_GEM_ERR_DEBUG 0
@@ -266,9 +272,10 @@
 #define PHY_REG_EXT_PHYSPCFC_ST   27
 #define PHY_REG_CABLE_DIAG   28
 
-#define PHY_REG_CONTROL_RST  0x8000
-#define PHY_REG_CONTROL_LOOP 0x4000
-#define PHY_REG_CONTROL_ANEG 0x1000
+#define PHY_REG_CONTROL_RST       0x8000
+#define PHY_REG_CONTROL_LOOP      0x4000
+#define PHY_REG_CONTROL_ANEG      0x1000
+#define PHY_REG_CONTROL_ANRESTART 0x0200
 
 #define PHY_REG_STATUS_LINK     0x0004
 #define PHY_REG_STATUS_ANEGCMPL 0x0020
@@ -339,11 +346,6 @@ static inline unsigned tx_desc_get_last(uint32_t *desc)
     return (desc[1] & DESC_1_TX_LAST) ? 1 : 0;
 }
 
-static inline void tx_desc_set_last(uint32_t *desc)
-{
-    desc[1] |= DESC_1_TX_LAST;
-}
-
 static inline unsigned tx_desc_get_length(uint32_t *desc)
 {
     return desc[1] & DESC_1_LENGTH;
@@ -403,6 +405,11 @@ static inline void rx_desc_set_ownership(uint32_t *desc)
 static inline void rx_desc_set_sof(uint32_t *desc)
 {
     desc[1] |= DESC_1_RX_SOF;
+}
+
+static inline void rx_desc_clear_control(uint32_t *desc)
+{
+    desc[1]  = 0;
 }
 
 static inline void rx_desc_set_eof(uint32_t *desc)
@@ -513,7 +520,7 @@ static void phy_update_link(CadenceGEMState *s)
     }
 }
 
-static int gem_can_receive(NetClientState *nc)
+static bool gem_can_receive(NetClientState *nc)
 {
     CadenceGEMState *s;
     int i;
@@ -526,7 +533,7 @@ static int gem_can_receive(NetClientState *nc)
             s->can_rx_state = 1;
             DB_PRINT("can't receive - no enable\n");
         }
-        return 0;
+        return false;
     }
 
     for (i = 0; i < s->num_priority_queues; i++) {
@@ -540,14 +547,14 @@ static int gem_can_receive(NetClientState *nc)
             s->can_rx_state = 2;
             DB_PRINT("can't receive - all the buffer descriptors are busy\n");
         }
-        return 0;
+        return false;
     }
 
     if (s->can_rx_state != 0) {
         s->can_rx_state = 0;
         DB_PRINT("can receive\n");
     }
-    return 1;
+    return true;
 }
 
 /*
@@ -663,7 +670,7 @@ static unsigned calc_mac_hash(const uint8_t *mac)
 static int gem_mac_address_filter(CadenceGEMState *s, const uint8_t *packet)
 {
     uint8_t *gem_spaddr;
-    int i;
+    int i, is_mc;
 
     /* Promiscuous mode? */
     if (s->regs[GEM_NWCFG] & GEM_NWCFG_PROMISC) {
@@ -679,22 +686,17 @@ static int gem_mac_address_filter(CadenceGEMState *s, const uint8_t *packet)
     }
 
     /* Accept packets -w- hash match? */
-    if ((packet[0] == 0x01 && (s->regs[GEM_NWCFG] & GEM_NWCFG_MCAST_HASH)) ||
-        (packet[0] != 0x01 && (s->regs[GEM_NWCFG] & GEM_NWCFG_UCAST_HASH))) {
+    is_mc = is_multicast_ether_addr(packet);
+    if ((is_mc && (s->regs[GEM_NWCFG] & GEM_NWCFG_MCAST_HASH)) ||
+        (!is_mc && (s->regs[GEM_NWCFG] & GEM_NWCFG_UCAST_HASH))) {
+        uint64_t buckets;
         unsigned hash_index;
 
         hash_index = calc_mac_hash(packet);
-        if (hash_index < 32) {
-            if (s->regs[GEM_HASHLO] & (1<<hash_index)) {
-                return packet[0] == 0x01 ? GEM_RX_MULTICAST_HASH_ACCEPT :
-                                           GEM_RX_UNICAST_HASH_ACCEPT;
-            }
-        } else {
-            hash_index -= 32;
-            if (s->regs[GEM_HASHHI] & (1<<hash_index)) {
-                return packet[0] == 0x01 ? GEM_RX_MULTICAST_HASH_ACCEPT :
-                                           GEM_RX_UNICAST_HASH_ACCEPT;
-            }
+        buckets = ((uint64_t)s->regs[GEM_HASHHI] << 32) | s->regs[GEM_HASHLO];
+        if ((buckets >> hash_index) & 1) {
+            return is_mc ? GEM_RX_MULTICAST_HASH_ACCEPT
+                         : GEM_RX_UNICAST_HASH_ACCEPT;
         }
     }
 
@@ -918,7 +920,7 @@ static ssize_t gem_receive(NetClientState *nc, const uint8_t *buf, size_t size)
     /* Is this destination MAC address "for us" ? */
     maf = gem_mac_address_filter(s, buf);
     if (maf == GEM_RX_REJECT) {
-        return -1;
+        return size;  /* no, drop siliently b/c it's not an error */
     }
 
     /* Discard packets with receive length error enabled ? */
@@ -998,21 +1000,22 @@ static ssize_t gem_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 
         /* Do nothing if receive is not enabled. */
         if (!gem_can_receive(nc)) {
-            assert(!first_desc);
             return -1;
         }
 
-        DB_PRINT("copy %" PRIu32 " bytes to 0x%" PRIx64 "\n",
-                MIN(bytes_to_copy, rxbufsize),
-                rx_desc_get_buffer(s, s->rx_desc[q]) + rxbuf_offset);
+        DB_PRINT("copy %u bytes to 0x%" PRIx64 "\n",
+                 MIN(bytes_to_copy, rxbufsize),
+                 rx_desc_get_buffer(s, s->rx_desc[q]));
 
         /* Copy packet data to emulated DMA buffer */
         address_space_write(&s->dma_as, rx_desc_get_buffer(s, s->rx_desc[q]) +
-                                    rxbuf_offset,
-                         *s->attr, rxbuf_ptr,
-                         MIN(bytes_to_copy, rxbufsize));
+                                                                  rxbuf_offset,
+                            *s->attr, rxbuf_ptr,
+                            MIN(bytes_to_copy, rxbufsize));
         rxbuf_ptr += MIN(bytes_to_copy, rxbufsize);
         bytes_to_copy -= MIN(bytes_to_copy, rxbufsize);
+
+        rx_desc_clear_control(s->rx_desc[q]);
 
         /* Update the descriptor.  */
         if (first_desc) {
@@ -1045,9 +1048,10 @@ static ssize_t gem_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 
         /* Descriptor write-back.  */
         desc_addr = gem_get_rx_desc_addr(s, q);
-        address_space_write(&s->dma_as, desc_addr, *s->attr,
-                         (uint8_t *)s->rx_desc[q],
-                         sizeof(uint32_t) * gem_get_desc_len(s, true));
+        address_space_write(&s->dma_as, desc_addr,
+                            *s->attr,
+                            (uint8_t *)s->rx_desc[q],
+                            sizeof(uint32_t) * gem_get_desc_len(s, true));
 
         /* Next descriptor */
         if (rx_desc_get_wrap(s->rx_desc[q])) {
@@ -1155,9 +1159,9 @@ static void gem_transmit(CadenceGEMState *s)
         packet_desc_addr = gem_get_tx_desc_addr(s, q);
 
         DB_PRINT("read descriptor 0x%" HWADDR_PRIx "\n", packet_desc_addr);
-        address_space_read(&s->dma_as, packet_desc_addr, *s->attr,
-                         (uint8_t *)desc,
-                         sizeof(uint32_t) * gem_get_desc_len(s, false));
+        address_space_read(&s->dma_as, packet_desc_addr,
+                           *s->attr, (uint8_t *)desc,
+                           sizeof(uint32_t) * gem_get_desc_len(s, false));
         /* Handle all descriptors owned by hardware */
         while (tx_desc_get_used(desc) == 0) {
 
@@ -1179,10 +1183,9 @@ static void gem_transmit(CadenceGEMState *s)
 
             if (tx_desc_get_length(desc) > sizeof(tx_packet) -
                                                (p - tx_packet)) {
-                DB_PRINT("TX descriptor @ 0x%" HWADDR_PRIx " \
-                         too large: size 0x%"PRIx32" space 0x%"PRIx64"\n",
-                         packet_desc_addr,
-                         tx_desc_get_length(desc),
+                DB_PRINT("TX descriptor @ 0x%" HWADDR_PRIx \
+                         " too large: size 0x%x space 0x%zx\n",
+                         packet_desc_addr, tx_desc_get_length(desc),
                          sizeof(tx_packet) - (p - tx_packet));
                 break;
             }
@@ -1191,8 +1194,8 @@ static void gem_transmit(CadenceGEMState *s)
              * contig buffer.
              */
             address_space_read(&s->dma_as, tx_desc_get_buffer(s, desc),
-                             *s->attr,
-                             p, tx_desc_get_length(desc));
+                               *s->attr,
+                               p, tx_desc_get_length(desc));
             p += tx_desc_get_length(desc);
             total_bytes += tx_desc_get_length(desc);
 
@@ -1204,17 +1207,21 @@ static void gem_transmit(CadenceGEMState *s)
                 /* Modify the 1st descriptor of this packet to be owned by
                  * the processor.
                  */
-                address_space_read(&s->dma_as, desc_addr, *s->attr,
-                                (uint8_t *)desc_first, sizeof(desc_first));
+                address_space_read(&s->dma_as, desc_addr,
+                                   *s->attr,
+                                   (uint8_t *)desc_first,
+                                   sizeof(desc_first));
                 tx_desc_set_used(desc_first);
-                address_space_write(&s->dma_as, desc_addr, *s->attr,
-                                 (uint8_t *)desc_first, sizeof(desc_first));
+                address_space_write(&s->dma_as, desc_addr,
+                                   *s->attr,
+                                   (uint8_t *)desc_first,
+                                    sizeof(desc_first));
                 /* Advance the hardware current descriptor past this packet */
                 if (tx_desc_get_wrap(desc)) {
                     s->tx_desc_addr[q] = gem_get_queue_base_addr(s,
                                          true, q);
                 } else {
-                    s->tx_desc_addr[q] +=
+                    s->tx_desc_addr[q] = (uint32_t)packet_desc_addr +
                                          4 * gem_get_desc_len(s, false);
                 }
                 DB_PRINT("TX descriptor next: 0x%08x\n", s->tx_desc_addr[q]);
@@ -1256,16 +1263,19 @@ static void gem_transmit(CadenceGEMState *s)
 
             /* read next descriptor */
             if (tx_desc_get_wrap(desc)) {
-                tx_desc_set_last(desc);
-                s->tx_desc_addr[q] = gem_get_queue_base_addr(s, true, q);
-                packet_desc_addr = gem_get_tx_desc_addr(s, q);
+                packet_desc_addr = 0;
+                if (s->regs[GEM_DMACFG] & GEM_DMACFG_ADDR_64B) {
+                    packet_desc_addr = s->regs[GEM_TBQPH];
+                    packet_desc_addr <<= 32;
+                }
+                packet_desc_addr |= gem_get_queue_base_addr(s, true, q);
             } else {
                 packet_desc_addr += 4 * gem_get_desc_len(s, false);
             }
             DB_PRINT("read descriptor 0x%" HWADDR_PRIx "\n", packet_desc_addr);
-            address_space_read(&s->dma_as, packet_desc_addr, *s->attr,
-                             (uint8_t *)desc,
-                             sizeof(uint32_t) * gem_get_desc_len(s, false));
+            address_space_read(&s->dma_as, packet_desc_addr,
+                               *s->attr, (uint8_t *)desc,
+                               sizeof(uint32_t) * gem_get_desc_len(s, false));
         }
 
         if (tx_desc_get_used(desc)) {
@@ -1377,7 +1387,7 @@ static void gem_phy_write(CadenceGEMState *s, unsigned reg_num, uint16_t val)
         }
         if (val & PHY_REG_CONTROL_ANEG) {
             /* Complete autonegotiation immediately */
-            val &= ~PHY_REG_CONTROL_ANEG;
+            val &= ~(PHY_REG_CONTROL_ANEG | PHY_REG_CONTROL_ANRESTART);
             s->phy_regs[PHY_REG_STATUS] |= PHY_REG_STATUS_ANEGCMPL;
         }
         if (val & PHY_REG_CONTROL_LOOP) {
@@ -1605,7 +1615,7 @@ static void gem_realize(DeviceState *dev, Error **errp)
     int i;
 
     address_space_init(&s->dma_as,
-                       s->dma_mr ? s->dma_mr : get_system_memory(), NULL);
+                       s->dma_mr ? s->dma_mr : get_system_memory(), "dma");
 
     if (s->num_priority_queues == 0 ||
         s->num_priority_queues > MAX_PRIORITY_QUEUES) {
@@ -1653,17 +1663,14 @@ static void gem_init(Object *obj)
     object_property_add_link(obj, "dma", TYPE_MEMORY_REGION,
                              (Object **)&s->dma_mr,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "memattr", TYPE_MEMORY_TRANSACTION_ATTR,
                              (Object **)&s->attr,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "mdio", TYPE_MDIO, (Object **)&s->mdio,
                              qdev_prop_allow_set_link,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static const VMStateDescription vmstate_cadence_gem = {
@@ -1700,7 +1707,7 @@ static void gem_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = gem_realize;
-    dc->props = gem_properties;
+    device_class_set_props(dc, gem_properties);
     dc->vmsd = &vmstate_cadence_gem;
     dc->reset = gem_reset;
 }

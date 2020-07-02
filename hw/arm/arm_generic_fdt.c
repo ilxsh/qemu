@@ -15,6 +15,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "hw/hw.h"
 #include "hw/boards.h"
 #include "hw/loader.h"
 #include "qapi/error.h"
@@ -22,6 +23,8 @@
 #include "qemu/error-report.h"
 #include "qemu/log.h"
 #include "qemu/config-file.h"
+#include "qemu/option.h"
+#include "sysemu/sysemu.h"
 #include "sysemu/qtest.h"
 #include "hw/arm/xlnx-zynqmp.h"
 
@@ -114,8 +117,9 @@ static int zynq7000_mdio_phy_connect(char *node_path, FDTMachineInfo *fdti,
     parent = fdt_init_get_opaque(fdti, parent_node_path);
 
     /* Add parent to mdio node */
-    object_property_add_child(OBJECT(parent), "mdio_child", OBJECT(Opaque),
-                              NULL);
+    if (!OBJECT(Opaque)->parent) {
+        object_property_add_child(OBJECT(parent), "mdio_child", OBJECT(Opaque));
+    }
 
     /* Set mdio property of gem device */
     object_property_set_link(OBJECT(parent), OBJECT(Opaque), "mdio", NULL);
@@ -258,6 +262,10 @@ static memory_info init_memory(void *fdt, ram_addr_t ram_size, bool zynq_7000)
         qemu_fdt_setprop_cells(fdt, "/memory", "qemu,ram", 1);
     }
 
+    if (zynq_7000) {
+        qemu_fdt_setprop_cell(fdt, "/amba/interrupt-controller@f8f01000",
+                              "num-priority-bits", 5);
+    }
     /* Instantiate peripherals from the FDT.  */
     fdti = fdt_generic_create_machine(fdt, NULL);
 
@@ -294,6 +302,7 @@ static memory_info init_memory(void *fdt, ram_addr_t ram_size, bool zynq_7000)
         uint64_t reg_value, mem_created = 0;
         int mem_container;
         char mem_node_path[DT_PATH_LENGTH];
+        int size_cells;
 
         do {
             mem_offset =
@@ -320,6 +329,8 @@ static memory_info init_memory(void *fdt, ram_addr_t ram_size, bool zynq_7000)
 
                 DB_PRINT(0, "Found top level memory region %s\n",
                          mem_node_path);
+                size_cells = qemu_fdt_getprop_cell(fdt, mem_node_path,
+                                                "#size-cells", 0, true, NULL);
 
                 reg_value = qemu_fdt_getprop_cell(fdt, mem_node_path,
                                                   "reg", 0, 0, NULL);
@@ -329,8 +340,8 @@ static memory_info init_memory(void *fdt, ram_addr_t ram_size, bool zynq_7000)
 
                 DB_PRINT(1, "    Address: 0x%" PRIx64 " ", reg_value);
 
-                reg_value += qemu_fdt_getprop_cell(fdt, mem_node_path,
-                                                   "reg", 2, 0, NULL);
+                reg_value += qemu_fdt_getprop_sized_cell(fdt, mem_node_path,
+                                                   "reg", 2, size_cells, NULL);
 
                 DB_PRINT_RAW(1, "Size: 0x%" PRIx64 "\n", reg_value);
 
@@ -406,9 +417,8 @@ static memory_info init_memory(void *fdt, ram_addr_t ram_size, bool zynq_7000)
                     ram_prop = qemu_fdt_getprop_cell(fdt, mem_node_path,
                                                      "qemu,ram", 0,
                                                      0, NULL);
-
-                    memory_region_init_ram(ram_region, NULL, region_name,
-                                           region_size, &error_fatal);
+                    memory_region_init(ram_region, NULL, region_name,
+                                           region_size);
                     object_property_set_int(OBJECT(ram_region), ram_prop,
                                             "ram", &error_abort);
                     memory_region_add_subregion(container, region_start,
@@ -552,7 +562,7 @@ static void arm_generic_fdt_init(MachineState *machine)
     }
 
     if (machine->kernel_filename) {
-        arm_load_kernel(ARM_CPU(first_cpu), &arm_generic_fdt_binfo);
+        arm_load_kernel(ARM_CPU(first_cpu), machine, &arm_generic_fdt_binfo);
     }
 
     return;
@@ -574,7 +584,7 @@ static void arm_generic_fdt_7000_init(MachineState *machine)
 
     dev = qdev_create(NULL, "arm.pl35x");
     object_property_add_child(container_get(qdev_get_machine(), "/unattached"),
-                              "pl353", OBJECT(dev), NULL);
+                              "pl353", OBJECT(dev));
     qdev_prop_set_uint8(dev, "x", 3);
     dinfo = drive_get_next(IF_PFLASH);
     att_dev = nand_init(dinfo ? blk_by_legacy_dinfo(dinfo)

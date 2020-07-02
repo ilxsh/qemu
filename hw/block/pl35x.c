@@ -32,6 +32,8 @@
 #include "sysemu/block-backend.h"
 #include "exec/address-spaces.h"
 #include "qemu/host-utils.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 
 #ifdef PL35X_ERR_DEBUG
@@ -240,25 +242,26 @@ static void pl35x_init_nand(SysBusDevice *dev, PL35xItf *itf)
     sysbus_init_mmio(dev, &itf->mm);
 }
 
-static int pl35x_init(SysBusDevice *dev)
+static void pl35x_realize(DeviceState *dev, Error **errp)
 {
     PL35xState *s = PL35X(dev);
+    SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     int itfn = 0;
 
     memory_region_init_io(&s->mmio, OBJECT(dev), &pl35x_ops, s, "pl35x_io",
                           0x1000);
-    sysbus_init_mmio(dev, &s->mmio);
+    sysbus_init_mmio(sbd, &s->mmio);
     if (s->x != 1) { /* everything cept PL351 has at least one SRAM */
-        pl35x_init_sram(dev, &s->itf[itfn]);
+        pl35x_init_sram(sbd, &s->itf[itfn]);
         itfn++;
     }
     if (s->x & 0x1) { /* PL351 and PL353 have NAND */
-        pl35x_init_nand(dev, &s->itf[itfn]);
+        pl35x_init_nand(sbd, &s->itf[itfn]);
     } else if (s->x == 4) { /* PL354 has a second SRAM */
-        pl35x_init_sram(dev, &s->itf[itfn]);
+        pl35x_init_sram(sbd, &s->itf[itfn]);
     }
-    return 0;
 }
+
 static void pl35x_initfn(Object *obj)
 {
     PL35xState *s = PL35X(obj);
@@ -266,13 +269,11 @@ static void pl35x_initfn(Object *obj)
     object_property_add_link(obj, "dev0", TYPE_DEVICE,
                              (Object **)&s->itf[0].dev,
                              object_property_allow_set_link,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "dev1", TYPE_DEVICE,
                              (Object **)&s->itf[1].dev,
                              object_property_allow_set_link,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static Property pl35x_properties[] = {
@@ -294,10 +295,9 @@ static const VMStateDescription vmstate_pl35x = {
 static void pl35x_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
-    SysBusDeviceClass *k = SYS_BUS_DEVICE_CLASS(klass);
 
-    k->init = pl35x_init;
-    dc->props = pl35x_properties;
+    dc->realize = pl35x_realize;
+    device_class_set_props(dc, pl35x_properties);
     dc->vmsd = &vmstate_pl35x;
 }
 

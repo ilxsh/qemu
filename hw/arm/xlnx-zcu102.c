@@ -17,34 +17,29 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
 #include "cpu.h"
 #include "hw/arm/xlnx-zynqmp.h"
 #include "hw/boards.h"
 #include "qemu/error-report.h"
-#include "exec/address-spaces.h"
 #include "qemu/log.h"
 #include "sysemu/qtest.h"
+#include "sysemu/device_tree.h"
 
 typedef struct XlnxZCU102 {
     MachineState parent_obj;
 
     XlnxZynqMPState soc;
-    MemoryRegion ddr_ram;
 
     bool secure;
     bool virt;
+
+    struct arm_boot_info binfo;
 } XlnxZCU102;
 
 #define TYPE_ZCU102_MACHINE   MACHINE_TYPE_NAME("xlnx-zcu102")
 #define ZCU102_MACHINE(obj) \
     OBJECT_CHECK(XlnxZCU102, (obj), TYPE_ZCU102_MACHINE)
 
-#define TYPE_EP108_MACHINE   MACHINE_TYPE_NAME("xlnx-ep108")
-#define EP108_MACHINE(obj) \
-    OBJECT_CHECK(XlnxZCU102, (obj), TYPE_EP108_MACHINE)
-
-static struct arm_boot_info xlnx_zcu102_binfo;
 
 static bool zcu102_get_secure(Object *obj, Error **errp)
 {
@@ -74,8 +69,38 @@ static void zcu102_set_virt(Object *obj, bool value, Error **errp)
     s->virt = value;
 }
 
-static void xlnx_zynqmp_init(XlnxZCU102 *s, MachineState *machine)
+static void zcu102_modify_dtb(const struct arm_boot_info *binfo, void *fdt)
 {
+    XlnxZCU102 *s = container_of(binfo, XlnxZCU102, binfo);
+    bool method_is_hvc;
+    char **node_path;
+    const char *r;
+    int prop_len;
+    int i;
+
+    /* If EL3 is enabled, we keep all firmware nodes active.  */
+    if (!s->secure) {
+        node_path = qemu_fdt_node_path(fdt, NULL, "xlnx,zynqmp-firmware",
+                                       &error_fatal);
+
+        for (i = 0; node_path && node_path[i]; i++) {
+            r = qemu_fdt_getprop(fdt, node_path[i], "method", &prop_len,
+                                 false, NULL);
+            method_is_hvc = r && !strcmp("hvc", r);
+
+            /* Allow HVC based firmware if EL2 is enabled.  */
+            if (method_is_hvc && s->virt) {
+                continue;
+            }
+            qemu_fdt_setprop_string(fdt, node_path[i], "status", "disabled");
+        }
+        g_strfreev(node_path);
+    }
+}
+
+static void xlnx_zcu102_init(MachineState *machine)
+{
+    XlnxZCU102 *s = ZCU102_MACHINE(machine);
     int i;
     uint64_t ram_size = machine->ram_size;
 
@@ -92,14 +117,10 @@ static void xlnx_zynqmp_init(XlnxZCU102 *s, MachineState *machine)
                  ram_size);
     }
 
-    memory_region_allocate_system_memory(&s->ddr_ram, NULL, "ddr-ram",
-                                         ram_size);
+    object_initialize_child(OBJECT(machine), "soc", &s->soc, sizeof(s->soc),
+                            TYPE_XLNX_ZYNQMP, &error_abort, NULL);
 
-    object_initialize(&s->soc, sizeof(s->soc), TYPE_XLNX_ZYNQMP);
-    object_property_add_child(OBJECT(machine), "soc", OBJECT(&s->soc),
-                              &error_abort);
-
-    object_property_set_link(OBJECT(&s->soc), OBJECT(&s->ddr_ram),
+    object_property_set_link(OBJECT(&s->soc), OBJECT(machine->ram),
                          "ddr-ram", &error_abort);
     object_property_set_bool(OBJECT(&s->soc), s->secure, "secure",
                              &error_fatal);
@@ -176,66 +197,10 @@ static void xlnx_zynqmp_init(XlnxZCU102 *s, MachineState *machine)
 
     /* TODO create and connect IDE devices for ide_drive_get() */
 
-    xlnx_zcu102_binfo.ram_size = ram_size;
-    xlnx_zcu102_binfo.kernel_filename = machine->kernel_filename;
-    xlnx_zcu102_binfo.kernel_cmdline = machine->kernel_cmdline;
-    xlnx_zcu102_binfo.initrd_filename = machine->initrd_filename;
-    xlnx_zcu102_binfo.loader_start = 0;
-    arm_load_kernel(s->soc.boot_cpu_ptr, &xlnx_zcu102_binfo);
-}
-
-static void xlnx_ep108_init(MachineState *machine)
-{
-    XlnxZCU102 *s = EP108_MACHINE(machine);
-
-    if (!qtest_enabled()) {
-        info_report("The Xilinx EP108 machine is deprecated, please use the "
-                    "ZCU102 machine (which has the same features) instead.");
-    }
-
-    xlnx_zynqmp_init(s, machine);
-}
-
-static void xlnx_ep108_machine_instance_init(Object *obj)
-{
-    XlnxZCU102 *s = EP108_MACHINE(obj);
-
-    /* EP108, we don't support setting secure or virt */
-    s->secure = false;
-    s->virt = false;
-}
-
-static void xlnx_ep108_machine_class_init(ObjectClass *oc, void *data)
-{
-    MachineClass *mc = MACHINE_CLASS(oc);
-
-    mc->desc = "Xilinx ZynqMP EP108 board (Deprecated, please use xlnx-zcu102)";
-    mc->init = xlnx_ep108_init;
-    mc->block_default_type = IF_IDE;
-    mc->units_per_default_bus = 1;
-    mc->ignore_memory_transaction_failures = true;
-    mc->max_cpus = XLNX_ZYNQMP_NUM_APU_CPUS + XLNX_ZYNQMP_NUM_RPU_CPUS;
-    mc->default_cpus = XLNX_ZYNQMP_NUM_APU_CPUS;
-}
-
-static const TypeInfo xlnx_ep108_machine_init_typeinfo = {
-    .name       = MACHINE_TYPE_NAME("xlnx-ep108"),
-    .parent     = TYPE_MACHINE,
-    .class_init = xlnx_ep108_machine_class_init,
-    .instance_init = xlnx_ep108_machine_instance_init,
-    .instance_size = sizeof(XlnxZCU102),
-};
-
-static void xlnx_ep108_machine_init_register_types(void)
-{
-    type_register_static(&xlnx_ep108_machine_init_typeinfo);
-}
-
-static void xlnx_zcu102_init(MachineState *machine)
-{
-    XlnxZCU102 *s = ZCU102_MACHINE(machine);
-
-    xlnx_zynqmp_init(s, machine);
+    s->binfo.ram_size = ram_size;
+    s->binfo.loader_start = 0;
+    s->binfo.modify_dtb = zcu102_modify_dtb;
+    arm_load_kernel(s->soc.boot_cpu_ptr, machine, &s->binfo);
 }
 
 static void xlnx_zcu102_machine_instance_init(Object *obj)
@@ -245,28 +210,26 @@ static void xlnx_zcu102_machine_instance_init(Object *obj)
     /* Default to secure mode being disabled */
     s->secure = false;
     object_property_add_bool(obj, "secure", zcu102_get_secure,
-                             zcu102_set_secure, NULL);
+                             zcu102_set_secure);
     object_property_set_description(obj, "secure",
                                     "Set on/off to enable/disable the ARM "
-                                    "Security Extensions (TrustZone)",
-                                    NULL);
+                                    "Security Extensions (TrustZone)");
 
     /* Default to virt (EL2) being disabled */
     s->virt = false;
     object_property_add_bool(obj, "virtualization", zcu102_get_virt,
-                             zcu102_set_virt, NULL);
+                             zcu102_set_virt);
     object_property_set_description(obj, "virtualization",
                                     "Set on/off to enable/disable emulating a "
                                     "guest CPU which implements the ARM "
-                                    "Virtualization Extensions",
-                                    NULL);
+                                    "Virtualization Extensions");
 }
 
 static void xlnx_zcu102_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
-    mc->desc = "Xilinx ZynqMP ZCU102 board with 4xA53s and 2xR5s based on " \
+    mc->desc = "Xilinx ZynqMP ZCU102 board with 4xA53s and 2xR5Fs based on " \
                "the value of smp";
     mc->init = xlnx_zcu102_init;
     mc->block_default_type = IF_IDE;
@@ -274,6 +237,7 @@ static void xlnx_zcu102_machine_class_init(ObjectClass *oc, void *data)
     mc->ignore_memory_transaction_failures = true;
     mc->max_cpus = XLNX_ZYNQMP_NUM_APU_CPUS + XLNX_ZYNQMP_NUM_RPU_CPUS;
     mc->default_cpus = XLNX_ZYNQMP_NUM_APU_CPUS;
+    mc->default_ram_id = "ddr-ram";
 }
 
 static const TypeInfo xlnx_zcu102_machine_init_typeinfo = {
@@ -290,4 +254,3 @@ static void xlnx_zcu102_machine_init_register_types(void)
 }
 
 type_init(xlnx_zcu102_machine_init_register_types)
-type_init(xlnx_ep108_machine_init_register_types)

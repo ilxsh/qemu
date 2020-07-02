@@ -28,10 +28,13 @@
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "hw/register.h"
+#include "hw/irq.h"
 #include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "sysemu/sysemu.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 #include "cpu.h"
 
 #ifndef XILINX_APU_CTRL_ERR_DEBUG
@@ -136,17 +139,19 @@ static void rvbar_postw(RegisterInfo *reg, uint64_t val64)
     XlnxZynq3APUCtrl *s = XILINX_APU_CTRL(reg->opaque);
     int i;
 
-    for (i = 0; i < MIN(smp_cpus, MAX_CPUS); i++) {
+    for (i = 0; i < MAX_CPUS; i++) {
         uint64_t rvbar;
 
-        if (s->cpus[i]) {
-            rvbar = s->regs[R_RVBARADDR0H + i * 2];
-            rvbar <<= 32;
-            rvbar |= s->regs[R_RVBARADDR0L + i * 2];
-
-            object_property_set_int(OBJECT(s->cpus[i]), rvbar, "rvbar",
-                                    &error_abort);
+        if (!s->cpus[i]) {
+            break;
         }
+
+        rvbar = s->regs[R_RVBARADDR0H + i * 2];
+        rvbar <<= 32;
+        rvbar |= s->regs[R_RVBARADDR0L + i * 2];
+
+        object_property_set_int(OBJECT(s->cpus[i]), rvbar, "rvbar",
+                                &error_abort);
     }
 }
 
@@ -255,10 +260,9 @@ static void apu_ctrl_init(Object *obj)
     for (i = 0; i < MAX_CPUS; ++i) {
         char *prop_name = g_strdup_printf("cpu%d", i);
         object_property_add_link(obj, prop_name, TYPE_ARM_CPU,
-                                 (Object **)&s->cpus[i],
-                                 qdev_prop_allow_set_link_before_realize,
-                                 OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                                 &error_abort);
+                             (Object **)&s->cpus[i],
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
         g_free(prop_name);
     }
 

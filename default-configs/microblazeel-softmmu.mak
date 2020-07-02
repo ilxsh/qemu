@@ -1,7 +1,6 @@
 # Default configuration for microblazeel-softmmu
 
 include microblaze-softmmu.mak
-include pci.mak
 
 CONFIG_XILINX_IOMODULE_UART=y
 CONFIG_XILINX_IOMODULE_PIT=y
@@ -18,5 +17,9 @@ CONFIG_SDHCI=y
 CONFIG_SD=y
 CONFIG_CADENCE=y
 CONFIG_XILINX_SPIPS=y
+CONFIG_XILINX_AXIQSPI=y
 CONFIG_ZYNQ_DEVCFG=y
 CONFIG_PL011=y
+
+# Xilinx
+CONFIG_CAN_BUS=y

@@ -20,11 +20,13 @@
 
 #include "qemu/osdep.h"
 #include "hw/hw.h"
+#include "hw/qdev-properties.h"
 #include "hw/block/flash.h"
 #include "sysemu/block-backend.h"
-#include "hw/qdev.h"
+#include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/module.h"
 
 #ifndef NAND_ERR_DEBUG
 #define NAND_ERR_DEBUG 1
@@ -480,7 +482,7 @@ static void nand_command(NANDFlashState *s)
         break;
 
     default:
-        printf("%s: Unknown NAND command 0x%02x\n", __FUNCTION__, s->cmd);
+        printf("%s: Unknown NAND command 0x%02x\n", __func__, s->cmd);
     }
 }
 
@@ -605,7 +607,7 @@ static void nand_class_init(ObjectClass *klass, void *data)
     dc->realize = nand_realize;
     dc->reset = nand_reset;
     dc->vmsd = &vmstate_nand;
-    dc->props = nand_properties;
+    device_class_set_props(dc, nand_properties);
 }
 
 static const TypeInfo nand_info = {
@@ -799,7 +801,7 @@ DeviceState *nand_init(BlockBackend *blk, int manf_id, int chip_id)
     DeviceState *dev;
 
     if (nand_flash_ids[chip_id].size == 0) {
-        hw_error("%s: Unsupported NAND chip ID.\n", __FUNCTION__);
+        hw_error("%s: Unsupported NAND chip ID.\n", __func__);
     }
     dev = DEVICE(object_new(TYPE_NAND));
     qdev_prop_set_uint8(dev, "manufacturer_id", manf_id);

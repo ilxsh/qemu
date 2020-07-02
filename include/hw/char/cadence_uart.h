@@ -17,7 +17,9 @@
  */
 
 #ifndef CADENCE_UART_H
+#define CADENCE_UART_H
 
+#include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
 #include "chardev/char-fe.h"
 #include "qemu/timer.h"
@@ -47,6 +49,7 @@ typedef struct {
     CharBackend chr;
     qemu_irq irq;
     QEMUTimer *fifo_trigger_handle;
+    Clock *refclk;
 } CadenceUARTState;
 
 static inline DeviceState *cadence_uart_create(hwaddr addr,
@@ -66,5 +69,4 @@ static inline DeviceState *cadence_uart_create(hwaddr addr,
     return dev;
 }
 
-#define CADENCE_UART_H
 #endif

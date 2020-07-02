@@ -28,6 +28,8 @@
 #include "hw/stream.h"
 #include "hw/register.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #define TYPE_PMC_STREAM_ZERO "xlnx,pmc-stream-zero"
 
@@ -153,10 +155,9 @@ static void pmc_stream_zero_init(Object *obj)
                           TYPE_PMC_STREAM_ZERO, R_MAX * 4);
     sysbus_init_mmio(sbd, &s->iomem);
     object_property_add_link(obj, "stream-connected-pzm", TYPE_STREAM_SLAVE,
-                           (Object **) &s->tx_dev,
-                           qdev_prop_allow_set_link_before_realize,
-                           OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                           NULL);
+                             (Object **)&s->tx_dev,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
     for (i = 0; (i * 4) < PZM_BEAT_SIZE; i++) {
         s->data[i] = 0xDEADBEEF;
     }

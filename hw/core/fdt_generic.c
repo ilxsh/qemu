@@ -26,8 +26,12 @@
 
 #include "qemu/osdep.h"
 #include "hw/fdt_generic.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 #include "qemu/coroutine.h"
 #include "qemu/log.h"
+#include "hw/cpu/cluster.h"
+#include "sysemu/reset.h"
 
 #ifndef FDT_GENERIC_ERR_DEBUG
 #define FDT_GENERIC_ERR_DEBUG 0
@@ -42,7 +46,7 @@
 #define FDT_GENERIC_MAX_PATTERN_LEN 1024
 
 typedef struct TableListNode {
-    void *next;
+    struct TableListNode *next;
     char key[FDT_GENERIC_MAX_PATTERN_LEN];
     FDTInitFn fdt_init;
     void *opaque;
@@ -57,7 +61,7 @@ static void add_to_table(
         TableListNode **head_p)
 {
     TableListNode *nn = malloc(sizeof(*nn));
-    nn->next = (void *)(*head_p);
+    nn->next = *head_p;
     strcpy(nn->key, key);
     nn->fdt_init = fdt_init;
     nn->opaque = opaque;
@@ -76,14 +80,18 @@ static int fdt_init_search_table(
         const char *key, /* string to match */
         TableListNode **head) /* head of the list to search */
 {
-    TableListNode *c = *head;
-    if (c == NULL) {
-        return 1;
-    } else if (!strcmp(key, c->key)) {
-        return c->fdt_init ? c->fdt_init(node_path, fdti, c->opaque) : 0;
+    TableListNode *iter;
+
+    for (iter = *head; iter != NULL; iter = iter->next) {
+        if (!strcmp(key, iter->key)) {
+            if (iter->fdt_init) {
+                return iter->fdt_init(node_path, fdti, iter->opaque);
+            }
+            return 0;
+        }
     }
-    return fdt_init_search_table(node_path, fdti, key,
-        (TableListNode **)(&(*head)->next));
+
+    return 1;
 }
 
 TableListNode *compat_list_head;
@@ -113,11 +121,11 @@ int fdt_init_inst_bind(char *node_path, FDTMachineInfo *fdti,
 
 static void dump_table(TableListNode *head)
 {
-    if (head == NULL) {
-        return;
+    TableListNode *iter;
+
+    for (iter = head; iter != NULL; iter = iter->next) {
+        printf("key : %s, opaque data %p\n", head->key, head->opaque);
     }
-    printf("key : %s, opaque data %p\n", head->key, head->opaque);
-    dump_table(head->next);
 }
 
 void dump_compat_table(void)
@@ -165,6 +173,43 @@ int fdt_init_has_opaque(FDTMachineInfo *fdti, char *node_path)
     return 0;
 }
 
+static void *fdt_init_add_cpu_cluster(FDTMachineInfo *fdti, char *compat)
+{
+	static int i = 0;
+	FDTCPUCluster *cl = g_malloc0(sizeof(*cl));
+	char *name = g_strdup_printf("cluster%d", i);
+	Object *obj;
+
+	obj = object_new(TYPE_CPU_CLUSTER);
+	object_property_add_child(object_get_root(), name, OBJECT(obj));
+	qdev_prop_set_uint32(DEVICE(obj), "cluster-id", i++);
+
+	cl->cpu_type = g_strdup(compat);
+	cl->cpu_cluster = obj;
+	cl->next = fdti->clusters;
+
+	fdti->clusters = cl;
+
+	g_free(name);
+
+	return obj;
+}
+
+void *fdt_init_get_cpu_cluster(FDTMachineInfo *fdti, char *compat)
+{
+	FDTCPUCluster *cl = fdti->clusters;
+
+	while (cl) {
+		if (!strcmp(compat, cl->cpu_type)) {
+			return cl->cpu_cluster;
+		}
+		cl = cl->next;
+	}
+
+	/* No cluster found so create and return a new one */
+	return fdt_init_add_cpu_cluster(fdti, compat);
+}
+
 void *fdt_init_get_opaque(FDTMachineInfo *fdti, char *node_path)
 {
     FDTDevOpaque *dp;
@@ -189,7 +234,15 @@ FDTMachineInfo *fdt_init_new_fdti(void *fdt)
 
 void fdt_init_destroy_fdti(FDTMachineInfo *fdti)
 {
+    FDTCPUCluster *cl = fdti->clusters;
     FDTDevOpaque *dp;
+
+    while (cl) {
+	FDTCPUCluster *tmp = cl;
+	cl = cl->next;
+        g_free(tmp->cpu_type);
+        g_free(tmp);
+    }
     for (dp = fdti->dev_opaques; dp->node_path; dp++) {
         g_free(dp->node_path);
     }

@@ -19,36 +19,16 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "qemu/host-utils.h"
 #include "exec/exec-all.h"
 #include "exec/cpu_ldst.h"
-#include "hw/remote-port.h"
+#include "hw/irq.h"
+#include "fpu/softfloat.h"
 
 #define D(x)
-
-#if !defined(CONFIG_USER_ONLY)
-
-/* Try to fill the TLB and return an exception if error. If retaddr is
- * NULL, it means that the function was called in C code (i.e. not
- * from generated code or from helper.c)
- */
-void tlb_fill(CPUState *cs, target_ulong addr, MMUAccessType access_type,
-              int mmu_idx, uintptr_t retaddr)
-{
-    int ret;
-
-    ret = mb_cpu_handle_mmu_fault(cs, addr, access_type, mmu_idx);
-    if (unlikely(ret)) {
-        if (retaddr) {
-            /* now we have a real cpu fault */
-            cpu_restore_state(cs, retaddr);
-        }
-        cpu_loop_exit(cs);
-    }
-}
-#endif
 
 void helper_put(uint32_t id, uint32_t ctrl, uint32_t data)
 {
@@ -87,7 +67,7 @@ uint32_t helper_get(uint32_t id, uint32_t ctrl)
 
 void helper_raise_exception(CPUMBState *env, uint32_t index)
 {
-    CPUState *cs = CPU(mb_env_get_cpu(env));
+    CPUState *cs = env_cpu(env);
 
     cs->exception_index = index;
     cpu_loop_exit(cs);
@@ -95,7 +75,7 @@ void helper_raise_exception(CPUMBState *env, uint32_t index)
 
 void helper_sleep(CPUMBState *env)
 {
-    MicroBlazeCPU *cpu = mb_env_get_cpu(env);
+    MicroBlazeCPU *cpu = env_archcpu(env);
     CPUState *cs = CPU(cpu);
     CPUClass *cc = CPU_GET_CLASS(cs);
 
@@ -106,7 +86,9 @@ void helper_sleep(CPUMBState *env)
     }
 
 #if !defined(CONFIG_USER_ONLY)
+    qemu_mutex_lock_iothread();
     qemu_set_irq(cpu->mb_sleep, true);
+    qemu_mutex_unlock_iothread();
 #endif
     cs->halted = 1;
     cs->exception_index = EXCP_HLT;
@@ -122,7 +104,7 @@ void helper_debug(CPUMBState *env)
              "debug[%x] imm=%x iflags=%x\n",
              env->sregs[SR_MSR], env->sregs[SR_ESR], env->sregs[SR_EAR],
              env->debug, env->imm, env->iflags);
-    qemu_log("btaken=%d btarget=%x mode=%s(saved=%s) eip=%d ie=%d\n",
+    qemu_log("btaken=%d btarget=%" PRIx64 " mode=%s(saved=%s) eip=%d ie=%d\n",
              env->btaken, env->btarget,
              (env->sregs[SR_MSR] & MSR_UM) ? "user" : "kernel",
              (env->sregs[SR_MSR] & MSR_UMS) ? "user" : "kernel",
@@ -174,11 +156,12 @@ uint32_t helper_carry(uint32_t a, uint32_t b, uint32_t cf)
 
 static inline int div_prepare(CPUMBState *env, uint32_t a, uint32_t b)
 {
+    MicroBlazeCPU *cpu = env_archcpu(env);
+
     if (b == 0) {
         env->sregs[SR_MSR] |= MSR_DZ;
 
-        if ((env->sregs[SR_MSR] & MSR_EE)
-            && !(env->pvr.regs[2] & PVR2_DIV_ZERO_EXC_MASK)) {
+        if ((env->sregs[SR_MSR] & MSR_EE) && cpu->cfg.div_zero_exception) {
             env->sregs[SR_ESR] = ESR_EC_DIVZERO;
             helper_raise_exception(env, EXCP_HW_EXCP);
         }
@@ -360,7 +343,7 @@ uint32_t helper_fcmp_le(CPUMBState *env, uint32_t a, uint32_t b)
     fa.l = a;
     fb.l = b;
     set_float_exception_flags(0, &env->fp_status);
-    r = float32_le(fa.f, fb.f, &env->fp_status);
+    r = float32_le(fb.f, fa.f, &env->fp_status);
     flags = get_float_exception_flags(&env->fp_status);
     update_fpu_flags(env, flags & float_flag_invalid);
 
@@ -405,7 +388,7 @@ uint32_t helper_fcmp_ge(CPUMBState *env, uint32_t a, uint32_t b)
     fa.l = a;
     fb.l = b;
     set_float_exception_flags(0, &env->fp_status);
-    r = !float32_lt(fa.f, fb.f, &env->fp_status);
+    r = !float32_lt(fb.f, fa.f, &env->fp_status);
     flags = get_float_exception_flags(&env->fp_status);
     update_fpu_flags(env, flags & float_flag_invalid);
 
@@ -429,7 +412,7 @@ uint32_t helper_fint(CPUMBState *env, uint32_t a)
 
     set_float_exception_flags(0, &env->fp_status);
     fa.l = a;
-    r = float32_to_int32(fa.f, &env->fp_status);
+    r = float32_to_int32_round_to_zero(fa.f, &env->fp_status);
     flags = get_float_exception_flags(&env->fp_status);
     update_fpu_flags(env, flags);
 
@@ -509,26 +492,28 @@ void helper_mmu_write(CPUMBState *env, uint32_t ext, uint32_t rn, uint32_t v)
     mmu_write(env, ext, rn, v);
 }
 
-void mb_cpu_unassigned_access(CPUState *cs, hwaddr addr,
-                              bool is_write, bool is_exec, int is_asi,
-                              unsigned size)
+void mb_cpu_transaction_failed(CPUState *cs, hwaddr physaddr, vaddr addr,
+                               unsigned size, MMUAccessType access_type,
+                               int mmu_idx, MemTxAttrs attrs,
+                               MemTxResult response, uintptr_t retaddr)
 {
     MicroBlazeCPU *cpu;
     CPUMBState *env;
-
-    qemu_log_mask(CPU_LOG_INT, "Unassigned " TARGET_FMT_plx " wr=%d exe=%d\n",
-             addr, is_write ? 1 : 0, is_exec ? 1 : 0);
-    if (cs == NULL) {
-        return;
-    }
+    qemu_log_mask(CPU_LOG_INT, "Transaction failed: vaddr 0x%" VADDR_PRIx
+                  " physaddr 0x" TARGET_FMT_plx " size %d access type %s\n",
+                  addr, physaddr, size,
+                  access_type == MMU_INST_FETCH ? "INST_FETCH" :
+                  (access_type == MMU_DATA_LOAD ? "DATA_LOAD" : "DATA_STORE"));
     cpu = MICROBLAZE_CPU(cs);
     env = &cpu->env;
+
+    cpu_restore_state(cs, retaddr, true);
     if (!(env->sregs[SR_MSR] & MSR_EE)) {
         return;
     }
 
     env->sregs[SR_EAR] = addr;
-    if (is_exec) {
+    if (access_type == MMU_INST_FETCH) {
         if ((env->pvr.regs[2] & PVR2_IOPB_BUS_EXC_MASK)) {
             env->sregs[SR_ESR] = ESR_EC_INSN_BUS;
             helper_raise_exception(env, EXCP_HW_EXCP);

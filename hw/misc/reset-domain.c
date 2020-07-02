@@ -10,9 +10,12 @@
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/runstate.h"
+#include "sysemu/reset.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
-#include "hw/qdev.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #ifndef RESET_DOMAIN_DEBUG
 #define RESET_DOMAIN_DEBUG 0
@@ -95,11 +98,10 @@ static void reset_init(Object *obj)
         char mr_name[16];
 
         snprintf(mr_name, 16, "mr%d", i);
-        object_property_add_link(obj, mr_name,
-                                 TYPE_MEMORY_REGION, (Object **)&s->mr,
-                                 qdev_prop_allow_set_link_before_realize,
-                                 OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                                 &error_abort);
+        object_property_add_link(obj, mr_name, TYPE_MEMORY_REGION,
+                             (Object **)&s->mr,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
     }
 }
 
@@ -119,7 +121,7 @@ static void reset_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->reset = reset_reset;
-    dc->props = reset_props;
+    device_class_set_props(dc, reset_props);
 }
 
 static const TypeInfo reset_info = {

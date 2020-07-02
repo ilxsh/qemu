@@ -31,6 +31,8 @@
 #include "sysemu/dma.h"
 #include "hw/hw.h"
 #include "net/net.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "hw/remote-port.h"
 #include "hw/remote-port-device.h"
@@ -95,7 +97,7 @@ static void rp_net_tx(RemotePortDevice *rpd, struct rp_pkt *pkt)
                      data,  pkt->busaccess.len);
 }
 
-static int rp_net_can_rx(NetClientState *nc)
+static bool rp_net_can_rx(NetClientState *nc)
 {
     return true;
 }
@@ -176,14 +178,12 @@ static void rp_net_init(Object *obj)
 
     object_property_add_link(obj, "rp-adaptor0", "remote-port",
                              (Object **)&s->rx.rp,
-                             qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             qdev_prop_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "rp-adaptor1", "remote-port",
                              (Object **)&s->tx.rp,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static Property rp_net_properties[] = {
@@ -200,7 +200,7 @@ static void rp_net_class_init(ObjectClass *klass, void *data)
 
     dc->realize = rp_net_realize;
     dc->reset = rp_net_reset;
-    dc->props = rp_net_properties;
+    device_class_set_props(dc, rp_net_properties);
 
     rpdc->ops[RP_CMD_write] = rp_net_tx;
 }

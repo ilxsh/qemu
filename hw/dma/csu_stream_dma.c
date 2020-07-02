@@ -36,6 +36,8 @@
 #include "hw/register.h"
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "hw/fdt_generic_util.h"
 
@@ -146,7 +148,6 @@ typedef struct ZynqMPCSUDMA {
     StreamSlave *tx_dev;  /* Used as generic StreamSlave */
     StreamSlave *tx_dev0; /* Used for pmc dma0 */
     StreamSlave *tx_dev1; /* Used for pmc dma1 */
-    QEMUBH *bh;
     ptimer_state *src_timer;
 
     bool is_dst;
@@ -347,7 +348,7 @@ static void zynqmp_csu_dma_reset(DeviceState *dev)
 }
 
 static size_t zynqmp_csu_dma_stream_push(StreamSlave *obj, uint8_t *buf,
-                                          size_t len, uint32_t attr)
+                                          size_t len, bool eop)
 {
     ZynqMPCSUDMA *s = ZYNQMP_CSU_DMA(obj);
     uint32_t size = dmach_get_size(s);
@@ -392,6 +393,7 @@ static void zynqmp_csu_dma_src_notify(void *opaque)
     ZynqMPCSUDMA *s = ZYNQMP_CSU_DMA(opaque);
     unsigned char buf[4 * 1024];
 
+    ptimer_transaction_begin(s->src_timer);
     /* Stop the backpreassure timer.  */
     ptimer_stop(s->src_timer);
 
@@ -399,22 +401,22 @@ static void zynqmp_csu_dma_src_notify(void *opaque)
            stream_can_push(s->tx_dev, zynqmp_csu_dma_src_notify, s)) {
         uint32_t size = dmach_get_size(s);
         unsigned int plen = MIN(size, sizeof buf);
-        uint32_t attr = 0;
+        bool eop = false;
         size_t ret;
 
         /* Did we fit it all?  */
         if (size == plen && dmach_get_eop(s)) {
-            attr |= STREAM_ATTR_EOP;
+            eop = true;
         }
 
         /* DMA transfer.  */
         dmach_read(s, buf, plen);
-        ret = stream_push(s->tx_dev, buf, plen, attr);
+        ret = stream_push(s->tx_dev, buf, plen, eop);
         dmach_advance(s, ret);
     }
 
     /* REMOVE-ME?: Check for flow-control timeout. This is all theoretical as
-       we currently never see backpreassure.  */
+       we currently never see backpressure.  */
     if (dmach_timeout_enabled(s) && dmach_get_size(s)
         && !stream_can_push(s->tx_dev, zynqmp_csu_dma_src_notify, s)) {
         unsigned int timeout = ARRAY_FIELD_EX32(s->regs, CTRL, TIMEOUT_VAL);
@@ -427,6 +429,7 @@ static void zynqmp_csu_dma_src_notify(void *opaque)
         ptimer_run(s->src_timer, 1);
     }
 
+    ptimer_transaction_commit(s->src_timer);
     ronaldu_csu_dma_update_irq(s);
 }
 
@@ -627,8 +630,7 @@ static void zynqmp_csu_dma_realize(DeviceState *dev, Error **errp)
         s->tx_dev = s->tx_dev0 ? s->tx_dev0 :
                                  s->tx_dev1 ? s->tx_dev1 : 0;
     }
-    s->bh = qemu_bh_new(src_timeout_hit, s);
-    s->src_timer = ptimer_init(s->bh, PTIMER_POLICY_DEFAULT);
+    s->src_timer = ptimer_init(src_timeout_hit, s, PTIMER_POLICY_DEFAULT);
 
     if (s->dma_mr) {
         s->dma_as = g_malloc0(sizeof(AddressSpace));
@@ -654,30 +656,25 @@ static void zynqmp_csu_dma_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
 
     object_property_add_link(obj, "stream-connected-dma", TYPE_STREAM_SLAVE,
-                             (Object **) &s->tx_dev,
+                             (Object **)&s->tx_dev,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             NULL);
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "stream-connected-dma0", TYPE_STREAM_SLAVE,
-                             (Object **) &s->tx_dev0,
+                             (Object **)&s->tx_dev0,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             NULL);
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "stream-connected-dma1", TYPE_STREAM_SLAVE,
-                             (Object **) &s->tx_dev1,
+                             (Object **)&s->tx_dev1,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             NULL);
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "dma", TYPE_MEMORY_REGION,
                              (Object **)&s->dma_mr,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "memattr", TYPE_MEMORY_TRANSACTION_ATTR,
                              (Object **)&s->attr,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
 
 }
 
@@ -708,7 +705,7 @@ static void zynqmp_csu_dma_class_init(ObjectClass *klass, void *data)
     dc->reset = zynqmp_csu_dma_reset;
     dc->realize = zynqmp_csu_dma_realize;
     dc->vmsd = &vmstate_zynqmp_csu_dma;
-    dc->props = zynqmp_csu_dma_properties;
+    device_class_set_props(dc, zynqmp_csu_dma_properties);
 
     ssc->push = zynqmp_csu_dma_stream_push;
     ssc->can_push = zynqmp_csu_dma_stream_can_push;

@@ -37,8 +37,11 @@ struct RemotePort {
            int write;
        } pipe;
     } event;
+    Chardev *chrdev;
     CharBackend chr;
     bool do_sync;
+    bool doing_sync;
+    bool finalizing;
     /* To serialize writes to fd.  */
     QemuMutex write_mutex;
 
@@ -47,8 +50,6 @@ struct RemotePort {
     struct rp_peer_state peer;
 
     struct {
-        QEMUBH *bh;
-        QEMUBH *bh_resp;
         ptimer_state *ptimer;
         ptimer_state *ptimer_resp;
         bool resp_timer_enabled;
@@ -109,6 +110,9 @@ struct RemotePort {
  * Attaches a device onto an adaptor and binds it to a device number.
  */
 void rp_device_attach(Object *adaptor, Object *dev,
+                      int rp_nr, int dev_nr,
+                      Error **errp);
+void rp_device_detach(Object *adaptor, Object *dev,
                       int rp_nr, int dev_nr,
                       Error **errp);
 bool rp_time_warp_enable(bool en);

@@ -23,6 +23,8 @@
 #include "sysemu/blockdev.h"
 #include "hw/i2c/pca954x.h"
 #include "qemu/log.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #ifndef PCA954X_DEBUG
 #define PCA954X_DEBUG 0
@@ -62,7 +64,7 @@ static void pca954x_reset(DeviceState *dev)
     s->active_lanes = 0;
 }
 
-static int pca954x_recv(I2CSlave *i2c)
+static uint8_t pca954x_recv(I2CSlave *i2c)
 {
     PCA954XState *s = PCA954X(i2c);
     int i;
@@ -161,20 +163,26 @@ static int pca954x_decode_address(I2CSlave *i2c, uint8_t address)
         return 0;
     }
 
+    if (!s->active_lanes) {
+        return 1;
+    }
+
     for (i = 0; i < s->lanes; ++i) {
         if (s->active_lanes & (1 << i)) {
             DB_PRINT("starting active bus %d addr:%02x rnw:%d\n", i, address,
                     s->event == I2C_START_RECV);
             channel_status |= (i2c_start_transfer(s->busses[i], address,
                                s->event == I2C_START_RECV)) << i;
+        } else {
+            channel_status |= 1 << i;
         }
     }
 
-    if (s->active_lanes == channel_status) {
-        return 1;
+    if (s->active_lanes & (~channel_status & 0xFF)) {
+        return 0;
     }
 
-    return 0;
+    return 1;
 }
 
 static void pca954x_init(Object *obj)
@@ -240,7 +248,7 @@ static void pca954x_class_init(ObjectClass *klass, void *data)
     dc->realize = pca954x_realize;
     dc->reset = pca954x_reset;
     dc->vmsd = &vmstate_PCA954X;
-    dc->props = pca954x_properties;
+    device_class_set_props(dc, pca954x_properties);
     sc->device = data;
 }
 

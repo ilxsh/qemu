@@ -39,9 +39,28 @@ void *load_device_tree_from_sysfs(void);
  * NULL. If there is no error but no matching node was found, the
  * returned array contains a single element equal to NULL. If an error
  * was encountered when parsing the blob, the function returns NULL
+ *
+ * @name may be NULL to wildcard names and only match compatibility
+ * strings.
  */
-char **qemu_fdt_node_path(void *fdt, const char *name, char *compat,
+char **qemu_fdt_node_path(void *fdt, const char *name, const char *compat,
                           Error **errp);
+
+/**
+ * qemu_fdt_node_unit_path: return the paths of nodes matching a given
+ * node-name, ie. node-name and node-name@unit-address
+ * @fdt: pointer to the dt blob
+ * @name: node name
+ * @errp: handle to an error object
+ *
+ * returns a newly allocated NULL-terminated array of node paths.
+ * Use g_strfreev() to free it. If one or more nodes were found, the
+ * array contains the path of each node and the last element equals to
+ * NULL. If there is no error but no matching node was found, the
+ * returned array contains a single element equal to NULL. If an error
+ * was encountered when parsing the blob, the function returns NULL
+ */
+char **qemu_fdt_node_unit_path(void *fdt, const char *name, Error **errp);
 
 int qemu_fdt_setprop(void *fdt, const char *node_path,
                      const char *property, const void *val, int size);
@@ -180,6 +199,8 @@ int qemu_devtree_get_num_children(void *fdt, const char *node_path, int depth);
 char **qemu_devtree_get_children(void *fdt, const char *node_path, int depth);
 int qemu_devtree_num_props(void *fdt, const char *node_path);
 QEMUDevtreeProp *qemu_devtree_get_props(void *fdt, const char *node_path);
+QEMUDevtreeProp *qemu_devtree_prop_search(QEMUDevtreeProp *props,
+                                          const char *name);
 
 /* node getters */
 

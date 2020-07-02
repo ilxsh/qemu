@@ -1,7 +1,7 @@
 /*
  * QEMU remote port PCI device.
  *
- * Copyright (c) 2016 Xilinx Inc
+ * Copyright (c) 2016-2020 Xilinx Inc
  * Written by Edgar E. Iglesias <edgar.iglesias@xilinx.com>
  *
  * This code is licensed under the GNU GPL.
@@ -13,10 +13,15 @@
 #include "qapi/qmp/qerror.h"
 #include "qapi/error.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/msi.h"
+#include "hw/pci/msix.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "hw/remote-port.h"
 #include "hw/remote-port-device.h"
+#include "hw/remote-port-memory-master.h"
 #include "hw/remote-port-memory-slave.h"
 
 #include "hw/fdt_generic_util.h"
@@ -63,13 +68,6 @@
 
 typedef struct RemotePortPCIDevice RemotePortPCIDevice;
 
-typedef struct RemotePortMap {
-    RemotePortPCIDevice *parent;
-    MemoryRegion iomem;
-    uint32_t rp_dev;
-    uint64_t offset;
-} RemotePortMap;
-
 struct RemotePortPCIDevice {
     /*< private >*/
     PCIDevice parent_obj;
@@ -91,130 +89,23 @@ struct RemotePortPCIDevice {
         uint32_t class_id;
         uint8_t prog_if;
         uint8_t irq_pin;
+
+        /* Controls if the remote dev is responsible for the config space.  */
+        bool remote_config;
+
+        bool msi;
+        bool msix;
     } cfg;
     struct RemotePort *rp;
     struct rp_peer_state *peer;
 };
 
-static uint64_t rp_io_read(void *opaque, hwaddr addr, unsigned size,
-                           MemTxAttrs attr)
-{
-    RemotePortMap *map = opaque;
-    RemotePortPCIDevice *s = map->parent;
-    struct rp_pkt_busaccess_ext_base pkt;
-    struct rp_encode_busaccess_in in = {0};
-    uint64_t value = 0;
-    int64_t rclk;
-    uint8_t *data;
-    int len;
-    int i;
-    RemotePortDynPkt rsp;
-
-    DB_PRINT_L(1, "\n");
-
-    in.cmd = RP_CMD_read;
-    in.id = rp_new_id(s->rp);
-    in.flags = 0;
-    in.dev = map->rp_dev;
-    in.clk = rp_normalized_vmclk(s->rp);
-    in.master_id = attr.requester_id;
-    in.addr = addr;
-    in.attr |= attr.secure ? RP_BUS_ATTR_SECURE : 0;
-    in.size = size;
-    in.width = 0;
-    in.stream_width = size;
-    len = rp_encode_busaccess(s->peer, &pkt, &in);
-    rp_rsp_mutex_lock(s->rp);
-    rp_write(s->rp, (void *) &pkt, len);
-
-    rsp = rp_wait_resp(s->rp);
-    /* We dont support out of order answers yet.  */
-    assert(rsp.pkt->hdr.id == be32_to_cpu(pkt.hdr.id));
-
-    data = rp_busaccess_rx_dataptr(s->peer, &rsp.pkt->busaccess_ext_base);
-    for (i = 0; i < size; i++) {
-        value |= data[i] << (i * 8);
-    }
-    rclk = rsp.pkt->busaccess.timestamp;
-    rp_dpkt_invalidate(&rsp);
-    rp_rsp_mutex_unlock(s->rp);
-    rp_sync_vmclock(s->rp, in.clk, rclk);
-
-    /* Reads are sync-points, roll the sync timer.  */
-    rp_restart_sync_timer(s->rp);
-    rp_leave_iothread(s->rp);
-    DB_PRINT_L(0, "addr: %" HWADDR_PRIx " data: %" PRIx64 "\n", addr, value);
-    return value;
-}
-
-static void rp_io_write(void *opaque, hwaddr addr, uint64_t value,
-                        unsigned size, MemTxAttrs attr)
-{
-    RemotePortMap *map = opaque;
-    RemotePortPCIDevice *s = map->parent;
-    int64_t rclk;
-    RemotePortDynPkt rsp;
-
-    struct  {
-        struct rp_pkt_busaccess_ext_base pkt;
-        uint8_t reserved[8];
-    } pay;
-    uint8_t *data = rp_busaccess_tx_dataptr(s->peer, &pay.pkt);
-    struct rp_encode_busaccess_in in = {0};
-    int i;
-    int len;
-
-    DB_PRINT_L(0, "addr: %" HWADDR_PRIx " data: %" PRIx64 "\n", addr, value);
-
-    for (i = 0; i < 8; i++) {
-        data[i] = value >> (i * 8);
-    }
-
-    assert(size <= 8);
-
-    in.cmd = RP_CMD_write;
-    in.id = rp_new_id(s->rp);
-    in.dev = map->rp_dev;
-    in.clk = rp_normalized_vmclk(s->rp);
-    in.master_id = attr.requester_id;
-    in.addr = addr;
-    in.attr |= attr.secure ? RP_BUS_ATTR_SECURE : 0;
-    in.size = size;
-    in.stream_width = size;
-    len = rp_encode_busaccess(s->peer, &pay.pkt, &in);
-
-    rp_rsp_mutex_lock(s->rp);
-
-    rp_write(s->rp, (void *) &pay, len + size);
-
-    rsp = rp_wait_resp(s->rp);
-
-    /* We dont support out of order answers yet.  */
-    assert(rsp.pkt->hdr.id == be32_to_cpu(pay.pkt.hdr.id));
-    rclk = rsp.pkt->busaccess.timestamp;
-    rp_dpkt_invalidate(&rsp);
-    rp_rsp_mutex_unlock(s->rp);
-    rp_sync_vmclock(s->rp, in.clk, rclk);
-    /* Reads are sync-points, roll the sync timer.  */
-    rp_restart_sync_timer(s->rp);
-    rp_leave_iothread(s->rp);
-    DB_PRINT_L(1, "\n");
-}
-
 static void rp_io_access(MemoryTransaction *tr)
 {
-    MemTxAttrs attr = tr->attr;
-    void *opaque = tr->opaque;
-    hwaddr addr = tr->addr;
-    unsigned size = tr->size;
-    uint64_t value = tr->data.u64;;
-    bool is_write = tr->rw;
+    RemotePortMap *map = tr->opaque;
+    RemotePortPCIDevice *s = map->parent;
 
-    if (is_write) {
-        rp_io_write(opaque, addr, value, size, attr);
-    } else {
-        tr->data.u64 = rp_io_read(opaque, addr, size, attr);
-    }
+    rp_mm_access(s->rp, map->rp_dev, s->peer, tr, true, 0);
 }
 
 static const MemoryRegionOps rp_ops = {
@@ -222,55 +113,35 @@ static const MemoryRegionOps rp_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static uint32_t rp_pci_read_config(PCIDevice *pci_dev, uint32_t addr, int size)
+{
+    RemotePortPCIDevice *s = REMOTE_PORT_PCI_DEVICE(pci_dev);
+    MemoryTransaction tr = {
+        .addr = addr,
+        .rw = false,
+        .size = size,
+        .attr = MEMTXATTRS_UNSPECIFIED
+    };
+
+    rp_mm_access(s->rp, s->cfg.rp_dev, s->peer, &tr, true, 0);
+    DB_PRINT_L(0, "addr: %x data: %x\n", addr, (uint32_t) tr.data.u64);
+    return tr.data.u64;
+}
+
 static void rp_pci_write_config(PCIDevice *pci_dev, uint32_t addr,
                                 uint32_t value, int size)
 {
     RemotePortPCIDevice *s = REMOTE_PORT_PCI_DEVICE(pci_dev);
-    int64_t rclk;
-    RemotePortDynPkt rsp;
-
-    struct  {
-        struct rp_pkt_busaccess_ext_base pkt;
-        uint8_t reserved[8];
-    } pay;
-    uint8_t *data = rp_busaccess_tx_dataptr(s->peer, &pay.pkt);
-    struct rp_encode_busaccess_in in = {0};
-    int i;
-    int len;
+    MemoryTransaction tr = {
+        .addr = addr,
+        .rw = true,
+        .size = size,
+        .data.u64 = value,
+        .attr = MEMTXATTRS_UNSPECIFIED
+    };
 
     DB_PRINT_L(0, "addr: %x data: %x\n", addr, value);
-
-    for (i = 0; i < 8; i++) {
-        data[i] = value >> (i * 8);
-    }
-
-    assert(size <= 8);
-    in.clk = rp_normalized_vmclk(s->rp);
-    in.id = rp_new_id(s->rp);
-
-    in.cmd = RP_CMD_write;
-    in.dev = s->cfg.rp_dev;
-    in.addr = addr;
-    in.size = size;
-    in.stream_width = size;
-    len = rp_encode_busaccess(s->peer, &pay.pkt, &in);
-
-    rp_rsp_mutex_lock(s->rp);
-
-    rp_write(s->rp, (void *) &pay, len + size);
-
-    rsp = rp_wait_resp(s->rp);
-
-    /* We dont support out of order answers yet.  */
-    assert(rsp.pkt->hdr.id == be32_to_cpu(pay.pkt.hdr.id));
-    rclk = rsp.pkt->busaccess.timestamp;
-    rp_dpkt_invalidate(&rsp);
-    rp_rsp_mutex_unlock(s->rp);
-    rp_sync_vmclock(s->rp, in.clk, rclk);
-    /* Reads are sync-points, roll the sync timer.  */
-    rp_restart_sync_timer(s->rp);
-    rp_leave_iothread(s->rp);
-
+    rp_mm_access(s->rp, s->cfg.rp_dev, s->peer, &tr, true, 0);
     pci_default_write_config(pci_dev, addr, value, size);
     DB_PRINT_L(1, "\n");
 }
@@ -283,7 +154,22 @@ static void rp_gpio_interrupt(RemotePortDevice *rpd, struct rp_pkt *pkt)
     int level = pkt->interrupt.val;
 
     DB_PRINT_L(0, "%s: irq[%d]=%d\n", __func__, irq, level);
-    pci_set_irq(d, level);
+
+    /*
+     * If MSI/MSI-X is enabled, map interrupt wires onto MSI.
+     * This will only work when QEMU owns the CONFIG space.
+     */
+    if (s->cfg.msix && msix_enabled(d)) {
+        if (level) {
+            msix_notify(d, 0);
+        }
+    } else if (s->cfg.msi && msi_enabled(d)) {
+        if (level) {
+            msi_notify(d, 0);
+        }
+    } else {
+        pci_set_irq(d, level);
+    }
 }
 
 static void rp_pci_realize(PCIDevice *pci_dev, Error **errp)
@@ -303,32 +189,38 @@ static void rp_pci_realize(PCIDevice *pci_dev, Error **errp)
     pci_dev->config[PCI_CLASS_PROG] = s->cfg.prog_if;
     pci_dev->config[PCI_INTERRUPT_PIN] = s->cfg.irq_pin;
 
+    if (s->cfg.remote_config) {
+        pci_dev->config_read = rp_pci_read_config;
+    }
     /* The remote peer may want to snoop on CFG writes.  */
     pci_dev->config_write = rp_pci_write_config;
+
+    if (s->cfg.msi) {
+        msi_init(pci_dev, 0x60, 1, true, false, &error_fatal);
+    }
 
     /* Create and hook up the BARs.  */
     s->maps = g_new0(typeof(*s->maps), s->cfg.nr_io_bars + s->cfg.nr_mm_bars);
 
-    for (i = 0; i < s->cfg.nr_io_bars; i++) {
-        char *name = g_strdup_printf("rp-pci-io-%d", i);
+    for (i = 0; i < s->cfg.nr_io_bars + s->cfg.nr_mm_bars; i++) {
+        bool io_bar = i < s->cfg.nr_io_bars;
+        char *name = g_strdup_printf("rp-pci-%s-%d", io_bar ? "io" : "mmio", i);
+        uint8_t attr = io_bar ?
+               PCI_BASE_ADDRESS_SPACE_IO : PCI_BASE_ADDRESS_SPACE_MEMORY;
+
         memory_region_init_io(&s->maps[i].iomem, OBJECT(s), &rp_ops,
                               &s->maps[i], name, s->cfg.bar_size[i]);
-        pci_register_bar(pci_dev, i, PCI_BASE_ADDRESS_SPACE_IO,
-                         &s->maps[i].iomem);
+        pci_register_bar(pci_dev, i, attr, &s->maps[i].iomem);
         s->maps[i].rp_dev = RPDEV_PCI_BAR_BASE + i;
         s->maps[i].parent = s;
         g_free(name);
     }
-    for (; i < s->cfg.nr_mm_bars; i++) {
-        char *name = g_strdup_printf("rp-pci-mmio-%d", i);
-        memory_region_init_io(&s->maps[i].iomem, OBJECT(s), &rp_ops,
-                              &s->maps[i], name, s->cfg.bar_size[i]);
-        pci_register_bar(pci_dev, s->cfg.nr_io_bars + i,
-                         PCI_BASE_ADDRESS_SPACE_MEMORY,
-                         &s->maps[i].iomem);
-        s->maps[i].rp_dev = RPDEV_PCI_BAR_BASE + i;
-        s->maps[i].parent = s;
-        g_free(name);
+
+    if (s->cfg.msix) {
+        msix_init_exclusive_bar(pci_dev, 1,
+                                s->cfg.nr_io_bars + s->cfg.nr_mm_bars,
+                                NULL);
+        msix_vector_use(pci_dev, 0);
     }
 
     /* Setup the DMA dev.  */
@@ -342,6 +234,23 @@ static void rp_pci_realize(PCIDevice *pci_dev, Error **errp)
     object_property_set_bool(OBJECT(s->rp_dma), true, "realized", &error_abort);
 }
 
+static void rp_pci_exit(PCIDevice *pci_dev)
+{
+    RemotePortPCIDevice *s = REMOTE_PORT_PCI_DEVICE(pci_dev);
+
+    /* Setup the DMA dev.  */
+    rp_device_detach(OBJECT(s->rp), OBJECT(s->rp_dma), 0,
+                            s->cfg.rp_dev + RPDEV_PCI_DMA, &error_abort);
+    rp_device_detach(OBJECT(s->rp), OBJECT(s), 0,
+                            s->cfg.rp_dev, &error_abort);
+
+    /*
+     * Cannot be a child of us since as->root->owner gets reffed by
+     * address_space_init in rp_dma creating a circular dep.
+     */
+    object_unparent(OBJECT(s->rp_dma));
+}
+
 static void rp_pci_init(Object *obj)
 {
     RemotePortPCIDevice *s = REMOTE_PORT_PCI_DEVICE(obj);
@@ -349,15 +258,16 @@ static void rp_pci_init(Object *obj)
 
     object_property_add_link(obj, "rp-adaptor0", "remote-port",
                              (Object **)&s->rp,
-                             qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             qdev_prop_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
 
 
     tmp_obj = object_new(TYPE_REMOTE_PORT_MEMORY_SLAVE);
     s->rp_dma = REMOTE_PORT_MEMORY_SLAVE(tmp_obj);
 
-    object_property_add_child(obj, "rp-dma", tmp_obj, &error_abort);
+    object_property_add_child(obj, "rp-dma", tmp_obj);
+    /* add_child will grant us another ref, free the initial one.  */
+    object_unref(tmp_obj);
 }
 
 static Property rp_properties[] = {
@@ -384,6 +294,11 @@ static Property rp_properties[] = {
     DEFINE_PROP_UINT64("bar-size5", RemotePortPCIDevice,
                                     cfg.bar_size[5], 0x1000),
 
+    DEFINE_PROP_BOOL("remote-config", RemotePortPCIDevice,
+                     cfg.remote_config, false),
+    DEFINE_PROP_BOOL("msi", RemotePortPCIDevice, cfg.msi, false),
+    DEFINE_PROP_BOOL("msix", RemotePortPCIDevice, cfg.msix, false),
+
     /* These are read-only.  */
     DEFINE_PROP_UINT32("nr-devs", RemotePortPCIDevice, cfg.nr_devs, 20),
     DEFINE_PROP_END_OF_LIST()
@@ -396,10 +311,11 @@ static void rp_pci_class_init(ObjectClass *oc, void *data)
     PCIDeviceClass *k = PCI_DEVICE_CLASS(oc);
 
     dc->desc = "Remote-Port PCI Device";
-    dc->props = rp_properties;
+    device_class_set_props(dc, rp_properties);
 
     rpdc->ops[RP_CMD_interrupt] = rp_gpio_interrupt;
     k->realize = rp_pci_realize;
+    k->exit = rp_pci_exit;
     k->vendor_id = PCI_VENDOR_ID_XILINX;
     k->device_id = 0;
     k->revision = 0;

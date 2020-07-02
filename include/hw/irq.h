@@ -1,23 +1,9 @@
 #ifndef QEMU_IRQ_H
 #define QEMU_IRQ_H
 
-#include "qom/object.h"
-
 /* Generic IRQ/GPIO pin infrastructure.  */
 
 #define TYPE_IRQ "irq"
-
-typedef struct IRQState *qemu_irq;
-
-typedef void (*qemu_irq_handler)(void *opaque, int n, int level);
-
-struct IRQState {
-    Object parent_obj;
-
-    qemu_irq_handler handler;
-    void *opaque;
-    int n;
-};
 
 void qemu_set_irq(qemu_irq irq, int level);
 
@@ -60,13 +46,10 @@ void qemu_free_irq(qemu_irq irq);
 /* Returns a new IRQ with opposite polarity.  */
 qemu_irq qemu_irq_invert(qemu_irq irq);
 
-/* Returns a new IRQ which feeds into both the passed IRQs */
-qemu_irq qemu_irq_split(qemu_irq irq1, qemu_irq irq2);
-
-/* Returns a new IRQ set which connects 1:1 to another IRQ set, which
- * may be set later.
+/* Returns a new IRQ which feeds into both the passed IRQs.
+ * It's probably better to use the TYPE_SPLIT_IRQ device instead.
  */
-qemu_irq *qemu_irq_proxy(qemu_irq **target, int n);
+qemu_irq qemu_irq_split(qemu_irq irq1, qemu_irq irq2);
 
 /* For internal use in qtest.  Similar to qemu_irq_split, but operating
    on an existing vector of qemu_irq.  */

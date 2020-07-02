@@ -26,6 +26,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 #include "hw/mdio/mdio_slave.h"
 #include "hw/fdt_generic_util.h"
 
@@ -138,7 +140,7 @@ static void mdio_slave_class_init(ObjectClass *klass, void *data)
 
     set_bit(DEVICE_CATEGORY_MISC, k->categories);
     k->bus_type = TYPE_MDIO_BUS;
-    k->props = mdio_props;
+    device_class_set_props(k, mdio_props);
     fmc->parse_reg = mdio_slave_parse_reg;
 }
 
@@ -150,6 +152,7 @@ static const TypeInfo mdio_slave_info = {
     .class_init = mdio_slave_class_init,
     .interfaces = (InterfaceInfo []) {
         {TYPE_FDT_GENERIC_MMAP},
+        { },
     },
 };
 

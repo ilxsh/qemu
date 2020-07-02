@@ -61,15 +61,14 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/hw.h"
 #include "hw/pci/msi.h"
-#include "hw/i386/pc.h"
 #include "hw/pci/pci.h"
+#include "migration/vmstate.h"
+#include "qemu/module.h"
 #include "hw/isa/isa.h"
-#include "sysemu/block-backend.h"
 #include "sysemu/dma.h"
 #include "hw/ide/pci.h"
-#include "hw/ide/ahci_internal.h"
+#include "ahci_internal.h"
 
 #define ICH9_MSI_CAP_OFFSET     0x80
 #define ICH9_SATA_CAP_OFFSET    0xA8

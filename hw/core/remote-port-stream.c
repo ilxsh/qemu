@@ -28,9 +28,10 @@
 
 #include "qemu/bitops.h"
 #include "qapi/qmp/qerror.h"
-#include "hw/register-dep.h"
 #include "hw/stream.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 #include "hw/remote-port-device.h"
 
 #ifndef REMOTE_PORT_STREAM_ERR_DEBUG
@@ -125,20 +126,20 @@ static bool rp_stream_stream_can_push(StreamSlave *obj,
 
     if (s->rsp_pending) {
         s->notify = notify;
-        s->notify = notify_opaque;
+        s->notify_opaque = notify_opaque;
         return false;
     }
     return true;
 }
 
 static size_t rp_stream_stream_push(StreamSlave *obj, uint8_t *buf,
-                                    size_t len, uint32_t attr)
+                                    size_t len, bool eop)
 {
     RemotePortStream *s = REMOTE_PORT_STREAM(obj);
     RemotePortDynPkt rsp;
     struct rp_pkt_busaccess_ext_base pkt;
     struct rp_encode_busaccess_in in = {0};
-    uint64_t rp_attr = stream_attr_has_eop(attr) ? RP_BUS_ATTR_EOP : 0;
+    uint64_t rp_attr = eop ? RP_BUS_ATTR_EOP : 0;
     int64_t clk;
     int enclen;
 
@@ -161,7 +162,6 @@ static size_t rp_stream_stream_push(StreamSlave *obj, uint8_t *buf,
     rp_dpkt_invalidate(&rsp);
     rp_rsp_mutex_unlock(s->rp);
     rp_restart_sync_timer(s->rp);
-    rp_leave_iothread(s->rp);
     return len;
 }
 
@@ -169,16 +169,14 @@ static void rp_stream_init(Object *obj)
 {
     RemotePortStream *s = REMOTE_PORT_STREAM(obj);
 
-    object_property_add_link(obj, "axistream-connected",
-                             TYPE_STREAM_SLAVE, (Object **) &s->tx_dev,
+    object_property_add_link(obj, "axistream-connected", TYPE_STREAM_SLAVE,
+                             (Object **)&s->tx_dev,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
     object_property_add_link(obj, "rp-adaptor0", "remote-port",
                              (Object **)&s->rp,
-                             qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             qdev_prop_allow_set_link,
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static Property rp_properties[] = {
@@ -195,7 +193,7 @@ static void rp_stream_class_init(ObjectClass *oc, void *data)
 
     ssc->push = rp_stream_stream_push;
     ssc->can_push = rp_stream_stream_can_push;
-    dc->props = rp_properties;
+    device_class_set_props(dc, rp_properties);
     rpdc->ops[RP_CMD_write] = rp_stream_write;
 }
 

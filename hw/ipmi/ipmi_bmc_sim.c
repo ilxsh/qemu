@@ -27,7 +27,10 @@
 #include "qemu/timer.h"
 #include "hw/ipmi/ipmi.h"
 #include "qemu/error-report.h"
+#include "qemu/module.h"
 #include "hw/loader.h"
+#include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
 
 #define IPMI_NETFN_CHASSIS            0x00
 
@@ -38,6 +41,7 @@
 
 #define IPMI_NETFN_SENSOR_EVENT       0x04
 
+#define IPMI_CMD_PLATFORM_EVENT_MSG       0x02
 #define IPMI_CMD_SET_SENSOR_EVT_ENABLE    0x28
 #define IPMI_CMD_GET_SENSOR_EVT_ENABLE    0x29
 #define IPMI_CMD_REARM_SENSOR_EVTS        0x2a
@@ -163,22 +167,7 @@ typedef struct IPMISensor {
 #define MAX_SENSORS 20
 #define IPMI_WATCHDOG_SENSOR 0
 
-typedef struct IPMIBmcSim IPMIBmcSim;
-typedef struct RspBuffer RspBuffer;
-
 #define MAX_NETFNS 64
-
-typedef struct IPMICmdHandler {
-    void (*cmd_handler)(IPMIBmcSim *s,
-                        uint8_t *cmd, unsigned int cmd_len,
-                        RspBuffer *rsp);
-    unsigned int cmd_len_min;
-} IPMICmdHandler;
-
-typedef struct IPMINetfn {
-    unsigned int cmd_nums;
-    const IPMICmdHandler *cmd_handlers;
-} IPMINetfn;
 
 typedef struct IPMIRcvBufEntry {
     QTAILQ_ENTRY(IPMIRcvBufEntry) entry;
@@ -186,9 +175,6 @@ typedef struct IPMIRcvBufEntry {
     uint8_t buf[MAX_IPMI_MSG_SIZE];
 } IPMIRcvBufEntry;
 
-#define TYPE_IPMI_BMC_SIMULATOR "ipmi-bmc-sim"
-#define IPMI_BMC_SIMULATOR(obj) OBJECT_CHECK(IPMIBmcSim, (obj), \
-                                        TYPE_IPMI_BMC_SIMULATOR)
 struct IPMIBmcSim {
     IPMIBmc parent;
 
@@ -213,13 +199,13 @@ struct IPMIBmcSim {
     uint8_t device_rev;
     uint8_t fwrev1;
     uint8_t fwrev2;
-    uint8_t mfg_id[3];
-    uint8_t product_id[2];
+    uint32_t mfg_id;
+    uint16_t product_id;
 
     uint8_t restart_cause;
 
     uint8_t acpi_power_state[2];
-    uint8_t uuid[16];
+    QemuUUID uuid;
 
     IPMISel sel;
     IPMISdr sdr;
@@ -275,27 +261,7 @@ struct IPMIBmcSim {
 #define IPMI_BMC_WATCHDOG_ACTION_POWER_DOWN      2
 #define IPMI_BMC_WATCHDOG_ACTION_POWER_CYCLE     3
 
-struct RspBuffer {
-    uint8_t buffer[MAX_IPMI_MSG_SIZE];
-    unsigned int len;
-};
-
 #define RSP_BUFFER_INITIALIZER { }
-
-static inline void rsp_buffer_set_error(RspBuffer *rsp, uint8_t byte)
-{
-    rsp->buffer[2] = byte;
-}
-
-/* Add a byte to the response. */
-static inline void rsp_buffer_push(RspBuffer *rsp, uint8_t byte)
-{
-    if (rsp->len >= sizeof(rsp->buffer)) {
-        rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_TRUNCATED);
-        return;
-    }
-    rsp->buffer[rsp->len++] = byte;
-}
 
 static inline void rsp_buffer_pushmore(RspBuffer *rsp, uint8_t *bytes,
                                        unsigned int n)
@@ -443,16 +409,21 @@ static void sel_inc_reservation(IPMISel *sel)
 /* Returns 1 if the SEL is full and can't hold the event. */
 static int sel_add_event(IPMIBmcSim *ibs, uint8_t *event)
 {
+    uint8_t ts[4];
+
     event[0] = 0xff;
     event[1] = 0xff;
-    set_timestamp(ibs, event + 3);
+    set_timestamp(ibs, ts);
+    if (event[2] < 0xe0) { /* Don't set timestamps for type 0xe0-0xff. */
+        memcpy(event + 3, ts, 4);
+    }
     if (ibs->sel.next_free == MAX_SEL_SIZE) {
         ibs->sel.overflow = 1;
         return 1;
     }
     event[0] = ibs->sel.next_free & 0xff;
     event[1] = (ibs->sel.next_free >> 8) & 0xff;
-    memcpy(ibs->sel.last_addition, event + 3, 4);
+    memcpy(ibs->sel.last_addition, ts, 4);
     memcpy(ibs->sel.sel[ibs->sel.next_free], event, 16);
     ibs->sel.next_free++;
     sel_inc_reservation(&ibs->sel);
@@ -468,7 +439,9 @@ static int attn_set(IPMIBmcSim *ibs)
 
 static int attn_irq_enabled(IPMIBmcSim *ibs)
 {
-    return (IPMI_BMC_MSG_INTS_ON(ibs) && IPMI_BMC_MSG_FLAG_RCV_MSG_QUEUE_SET(ibs))
+    return (IPMI_BMC_MSG_INTS_ON(ibs) &&
+            (IPMI_BMC_MSG_FLAG_RCV_MSG_QUEUE_SET(ibs) ||
+             IPMI_BMC_MSG_FLAG_WATCHDOG_TIMEOUT_MASK_SET(ibs)))
         || (IPMI_BMC_EVBUF_FULL_INT_ENABLED(ibs) &&
             IPMI_BMC_MSG_FLAG_EVT_BUF_FULL_SET(ibs));
 }
@@ -619,8 +592,8 @@ static void ipmi_init_sensors_from_sdrs(IPMIBmcSim *s)
     }
 }
 
-static int ipmi_register_netfn(IPMIBmcSim *s, unsigned int netfn,
-                               const IPMINetfn *netfnd)
+int ipmi_sim_register_netfn(IPMIBmcSim *s, unsigned int netfn,
+                        const IPMINetfn *netfnd)
 {
     if ((netfn & 1) || (netfn >= MAX_NETFNS) || (s->netfns[netfn / 2])) {
         return -1;
@@ -861,11 +834,11 @@ static void get_device_id(IPMIBmcSim *ibs,
     rsp_buffer_push(rsp, ibs->fwrev2);
     rsp_buffer_push(rsp, ibs->ipmi_version);
     rsp_buffer_push(rsp, 0x07); /* sensor, SDR, and SEL. */
-    rsp_buffer_push(rsp, ibs->mfg_id[0]);
-    rsp_buffer_push(rsp, ibs->mfg_id[1]);
-    rsp_buffer_push(rsp, ibs->mfg_id[2]);
-    rsp_buffer_push(rsp, ibs->product_id[0]);
-    rsp_buffer_push(rsp, ibs->product_id[1]);
+    rsp_buffer_push(rsp, ibs->mfg_id & 0xff);
+    rsp_buffer_push(rsp, (ibs->mfg_id >> 8) & 0xff);
+    rsp_buffer_push(rsp, (ibs->mfg_id >> 16) & 0xff);
+    rsp_buffer_push(rsp, ibs->product_id & 0xff);
+    rsp_buffer_push(rsp, (ibs->product_id >> 8) & 0xff);
 }
 
 static void set_global_enables(IPMIBmcSim *ibs, uint8_t val)
@@ -930,8 +903,19 @@ static void get_device_guid(IPMIBmcSim *ibs,
 {
     unsigned int i;
 
+    /* An uninitialized uuid is all zeros, use that to know if it is set. */
     for (i = 0; i < 16; i++) {
-        rsp_buffer_push(rsp, ibs->uuid[i]);
+        if (ibs->uuid.data[i]) {
+            goto uuid_set;
+        }
+    }
+    /* No uuid is set, return an error. */
+    rsp_buffer_set_error(rsp, IPMI_CC_INVALID_CMD);
+    return;
+
+ uuid_set:
+    for (i = 0; i < 16; i++) {
+        rsp_buffer_push(rsp, ibs->uuid.data[i]);
     }
 }
 
@@ -1185,7 +1169,7 @@ static void set_watchdog_timer(IPMIBmcSim *ibs,
         break;
 
     case IPMI_BMC_WATCHDOG_PRE_NMI:
-        if (!k->do_hw_op(s, IPMI_SEND_NMI, 1)) {
+        if (k->do_hw_op(s, IPMI_SEND_NMI, 1)) {
             /* NMI not supported. */
             rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
             return;
@@ -1219,6 +1203,8 @@ static void get_watchdog_timer(IPMIBmcSim *ibs,
     rsp_buffer_push(rsp, ibs->watchdog_action);
     rsp_buffer_push(rsp, ibs->watchdog_pretimeout);
     rsp_buffer_push(rsp, ibs->watchdog_expired);
+    rsp_buffer_push(rsp, ibs->watchdog_timeout & 0xff);
+    rsp_buffer_push(rsp, (ibs->watchdog_timeout >> 8) & 0xff);
     if (ibs->watchdog_running) {
         long timeout;
         timeout = ((ibs->watchdog_expiry - ipmi_getmonotime() + 50000000)
@@ -1576,6 +1562,28 @@ static void set_sel_time(IPMIBmcSim *ibs,
     ibs->sel.time_offset = now.tv_sec - ((long) val);
 }
 
+static void platform_event_msg(IPMIBmcSim *ibs,
+                               uint8_t *cmd, unsigned int cmd_len,
+                               RspBuffer *rsp)
+{
+    uint8_t event[16];
+
+    event[2] = 2; /* System event record */
+    event[7] = cmd[2]; /* Generator ID */
+    event[8] = 0;
+    event[9] = cmd[3]; /* EvMRev */
+    event[10] = cmd[4]; /* Sensor type */
+    event[11] = cmd[5]; /* Sensor number */
+    event[12] = cmd[6]; /* Event dir / Event type */
+    event[13] = cmd[7]; /* Event data 1 */
+    event[14] = cmd[8]; /* Event data 2 */
+    event[15] = cmd[9]; /* Event data 3 */
+
+    if (sel_add_event(ibs, event)) {
+        rsp_buffer_set_error(rsp, IPMI_CC_OUT_OF_SPACE);
+    }
+}
+
 static void set_sensor_evt_enable(IPMIBmcSim *ibs,
                                   uint8_t *cmd, unsigned int cmd_len,
                                   RspBuffer *rsp)
@@ -1752,6 +1760,7 @@ static const IPMINetfn chassis_netfn = {
 };
 
 static const IPMICmdHandler sensor_event_cmds[] = {
+    [IPMI_CMD_PLATFORM_EVENT_MSG] = { platform_event_msg, 10 },
     [IPMI_CMD_SET_SENSOR_EVT_ENABLE] = { set_sensor_evt_enable, 4 },
     [IPMI_CMD_GET_SENSOR_EVT_ENABLE] = { get_sensor_evt_enable, 3 },
     [IPMI_CMD_REARM_SENSOR_EVTS] = { rearm_sensor_evts, 4 },
@@ -1802,8 +1811,8 @@ static const IPMICmdHandler storage_cmds[] = {
     [IPMI_CMD_GET_SEL_ENTRY] = { get_sel_entry, 8 },
     [IPMI_CMD_ADD_SEL_ENTRY] = { add_sel_entry, 18 },
     [IPMI_CMD_CLEAR_SEL] = { clear_sel, 8 },
-    [IPMI_CMD_GET_SEL_TIME] = { get_sel_time, 6 },
-    [IPMI_CMD_SET_SEL_TIME] = { set_sel_time },
+    [IPMI_CMD_GET_SEL_TIME] = { get_sel_time },
+    [IPMI_CMD_SET_SEL_TIME] = { set_sel_time, 6 },
 };
 
 static const IPMINetfn storage_netfn = {
@@ -1813,10 +1822,10 @@ static const IPMINetfn storage_netfn = {
 
 static void register_cmds(IPMIBmcSim *s)
 {
-    ipmi_register_netfn(s, IPMI_NETFN_CHASSIS, &chassis_netfn);
-    ipmi_register_netfn(s, IPMI_NETFN_SENSOR_EVENT, &sensor_event_netfn);
-    ipmi_register_netfn(s, IPMI_NETFN_APP, &app_netfn);
-    ipmi_register_netfn(s, IPMI_NETFN_STORAGE, &storage_netfn);
+    ipmi_sim_register_netfn(s, IPMI_NETFN_CHASSIS, &chassis_netfn);
+    ipmi_sim_register_netfn(s, IPMI_NETFN_SENSOR_EVENT, &sensor_event_netfn);
+    ipmi_sim_register_netfn(s, IPMI_NETFN_APP, &app_netfn);
+    ipmi_sim_register_netfn(s, IPMI_NETFN_STORAGE, &storage_netfn);
 }
 
 static uint8_t init_sdrs[] = {
@@ -1950,12 +1959,6 @@ static void ipmi_sim_realize(DeviceState *dev, Error **errp)
     ibs->acpi_power_state[0] = 0;
     ibs->acpi_power_state[1] = 0;
 
-    if (qemu_uuid_set) {
-        memcpy(&ibs->uuid, &qemu_uuid, 16);
-    } else {
-        memset(&ibs->uuid, 0, 16);
-    }
-
     ipmi_init_sensors_from_sdrs(ibs);
     register_cmds(ibs);
 
@@ -1968,6 +1971,14 @@ static Property ipmi_sim_properties[] = {
     DEFINE_PROP_UINT16("fruareasize", IPMIBmcSim, fru.areasize, 1024),
     DEFINE_PROP_STRING("frudatafile", IPMIBmcSim, fru.filename),
     DEFINE_PROP_STRING("sdrfile", IPMIBmcSim, sdr_filename),
+    DEFINE_PROP_UINT8("device_id", IPMIBmcSim, device_id, 0x20),
+    DEFINE_PROP_UINT8("ipmi_version", IPMIBmcSim, ipmi_version, 0x02),
+    DEFINE_PROP_UINT8("device_rev", IPMIBmcSim, device_rev, 0),
+    DEFINE_PROP_UINT8("fwrev1", IPMIBmcSim, fwrev1, 0),
+    DEFINE_PROP_UINT8("fwrev2", IPMIBmcSim, fwrev2, 0),
+    DEFINE_PROP_UINT32("mfg_id", IPMIBmcSim, mfg_id, 0),
+    DEFINE_PROP_UINT16("product_id", IPMIBmcSim, product_id, 0),
+    DEFINE_PROP_UUID_NODEFAULT("guid", IPMIBmcSim, uuid),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -1978,7 +1989,7 @@ static void ipmi_sim_class_init(ObjectClass *oc, void *data)
 
     dc->hotpluggable = false;
     dc->realize = ipmi_sim_realize;
-    dc->props = ipmi_sim_properties;
+    device_class_set_props(dc, ipmi_sim_properties);
     bk->handle_command = ipmi_sim_handle_command;
 }
 

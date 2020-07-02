@@ -17,6 +17,9 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifndef TARGET_MICROBLAZE_MMU_H
+#define TARGET_MICROBLAZE_MMU_H
+
 #define MMU_R_PID    0
 #define MMU_R_ZPR    1
 #define MMU_R_TLBX   2
@@ -56,7 +59,7 @@
 
 /* TLBX  */
 #define R_TBLX_MISS_SHIFT 31
-#define R_TBLX_MISS_MASK (1U << 31)
+#define R_TBLX_MISS_MASK (1U << R_TBLX_MISS_SHIFT)
 
 #define TLB_ENTRIES    64
 
@@ -93,3 +96,5 @@ unsigned int mmu_translate(struct microblaze_mmu *mmu,
 uint32_t mmu_read(CPUMBState *env, bool ea, uint32_t rn);
 void mmu_write(CPUMBState *env, bool ea, uint32_t rn, uint32_t v);
 void mmu_init(struct microblaze_mmu *mmu);
+
+#endif

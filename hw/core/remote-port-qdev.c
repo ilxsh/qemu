@@ -8,17 +8,17 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/qdev.h"
+#include "hw/qdev-core.h"
 #include "hw/sysbus.h"
 #include "monitor/monitor.h"
 #include "monitor/qdev.h"
-#include "qmp-commands.h"
 #include "sysemu/arch_init.h"
-#include "qapi/qmp/qerror.h"
+#include "qapi/error.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
 #include "qemu/help_option.h"
 #include "qemu/cutils.h"
+#include "qemu/option.h"
 
 #include "hw/remote-port.h"
 
@@ -75,6 +75,40 @@ void rp_device_attach(Object *adaptor, Object *dev,
     for (i = 0; i < nr_devs; i++) {
         name = g_strdup_printf("remote-port-dev%d", dev_nr + i);
         object_property_set_link(adaptor, dev, name, &err);
+        g_free(name);
+        if (err != NULL) {
+            error_propagate(errp, err);
+            return;
+        }
+    }
+}
+
+/* RP helper function to detach a device to an adaptor.  */
+void rp_device_detach(Object *adaptor, Object *dev,
+                      int rp_nr, int dev_nr,
+                      Error **errp)
+{
+    Error *err = NULL;
+    uint32_t nr_devs;
+    char *name;
+    int i;
+
+    assert(adaptor);
+    assert(dev);
+
+    name = g_strdup_printf("rp-adaptor%d", rp_nr);
+    object_property_set_link(dev, NULL, name, NULL);
+    g_free(name);
+
+    nr_devs = object_property_get_int(dev, "nr-devs", &err);
+    if (err) {
+        nr_devs = 1;
+        err = NULL;
+    }
+
+    for (i = 0; i < nr_devs; i++) {
+        name = g_strdup_printf("remote-port-dev%d", dev_nr + i);
+        object_property_set_link(adaptor, NULL, name, &err);
         g_free(name);
         if (err != NULL) {
             error_propagate(errp, err);

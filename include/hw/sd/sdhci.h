@@ -25,7 +25,6 @@
 #ifndef SDHCI_H
 #define SDHCI_H
 
-#include "qemu-common.h"
 #include "hw/pci/pci.h"
 #include "hw/sysbus.h"
 #include "hw/sd/sd.h"
@@ -45,6 +44,7 @@ typedef struct SDHCIState {
     AddressSpace *dma_as;
     MemoryRegion *dma_mr;
     const MemoryRegionOps *io_ops;
+    MemTxAttrs *memattr;
 
     QEMUTimer *insert_timer;       /* timer for 'changing' sd card. */
     QEMUTimer *transfer_timer;
@@ -116,5 +116,7 @@ typedef struct SDHCIState {
      OBJECT_CHECK(SDHCIState, (obj), TYPE_SYSBUS_SDHCI)
 
 #define TYPE_IMX_USDHC "imx-usdhc"
+
+#define TYPE_S3C_SDHCI "s3c-sdhci"
 
 #endif /* SDHCI_H */

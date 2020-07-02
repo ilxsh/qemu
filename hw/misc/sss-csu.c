@@ -31,7 +31,9 @@
 #include "hw/misc/sss.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
-#include "hw/register-dep.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
+#include "hw/register.h"
 #include "hw/misc/sss.h"
 
 #ifndef ZYNQMP_CSU_SSS_ERR_DEBUG
@@ -43,7 +45,7 @@
 #define ZYNQMP_CSU_SSS(obj) \
      OBJECT_CHECK(ZynqMPCSUSSS, (obj), TYPE_ZYNQMP_CSU_SSS)
 
-#define R_CFG 0
+REG32(CFG, 0x00)
 #define R_MAX (R_CFG + 1)
 #define R_CSU_SSS_FIELD_LENGTH 4
 
@@ -103,7 +105,7 @@ struct ZynqMPCSUSSS {
     MemoryRegion iomem;
 
     uint32_t regs[R_MAX];
-    DepRegisterInfo regs_info[R_MAX];
+    RegisterInfo regs_info[R_MAX];
 };
 
 static uint32_t zynqmp_csu_get_sss_regfield(SSSBase *p, int remote)
@@ -114,21 +116,22 @@ static uint32_t zynqmp_csu_get_sss_regfield(SSSBase *p, int remote)
                       R_CSU_SSS_FIELD_LENGTH);
 }
 
-static void r_cfg_post_write(DepRegisterInfo *reg, uint64_t val)
+static void r_cfg_post_write(RegisterInfo *reg, uint64_t val)
 {
     SSSBase *s = SSS_BASE(reg->opaque);
 
     sss_notify_all(s);
 }
 
-static const DepRegisterAccessInfo zynqmp_csu_sss_regs_info[] = {
-    [R_CFG] = { .name = "R_CFG", .ro = 0xFFF00000,
-                .post_write = r_cfg_post_write },
+static const RegisterAccessInfo zynqmp_csu_sss_regs_info[] = {
+    { .name = "R_CFG", .addr = A_CFG,
+      .ro = 0xFFF00000,
+      .post_write = r_cfg_post_write },
 };
 
 static const MemoryRegionOps sss_ops = {
-    .read = dep_register_read_memory_le,
-    .write = dep_register_write_memory_le,
+    .read = register_read_memory,
+    .write = register_write_memory,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 4,
@@ -141,32 +144,15 @@ static void zynqmp_csu_sss_realize(DeviceState *dev, Error **errp)
     ZynqMPCSUSSS *s = ZYNQMP_CSU_SSS(dev);
     SSSBase *p = SSS_BASE(dev);
     Error *local_errp = NULL;
-    int r, i;
-
-    for (i = 0; i < R_MAX; ++i) {
-        DepRegisterInfo *r = &s->regs_info[i];
-
-        *r = (DepRegisterInfo) {
-            .data = (uint8_t *)&s->regs[i],
-            .data_size = sizeof(uint32_t),
-            .access = &zynqmp_csu_sss_regs_info[i],
-            .debug = ZYNQMP_CSU_SSS_ERR_DEBUG,
-            .prefix = object_get_canonical_path(OBJECT(dev)),
-            .opaque = s,
-        };
-        memory_region_init_io(&r->mem, OBJECT(dev), &sss_ops, r,
-                              "sss-regs", 4);
-        memory_region_add_subregion(&s->iomem, i * 4, &r->mem);
-    }
+    int r;
 
     for (r = 0; r < NO_REMOTE; ++r) {
         SSSStream *ss = SSS_STREAM(&p->rx_devs[r]);
 
         object_property_add_link(OBJECT(ss), "sss", TYPE_ZYNQMP_CSU_SSS,
-                                 (Object **)&ss->sss,
-                                 qdev_prop_allow_set_link_before_realize,
-                                 OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                                 &local_errp);
+                             (Object **)&ss->sss,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
         if (local_errp) {
             goto zynqmp_csu_sss_realize_fail;
         }
@@ -192,7 +178,7 @@ static void sss_reset(DeviceState *dev)
     int i;
 
     for (i = 0; i < R_MAX; ++i) {
-        dep_register_reset(&s->regs_info[i]);
+        register_reset(&s->regs_info[i]);
     }
     sss_notify_all(p);
 }
@@ -202,6 +188,7 @@ static void zynqmp_csu_sss_init(Object *obj)
     SSSBase *p = SSS_BASE(obj);
     ZynqMPCSUSSS *s = ZYNQMP_CSU_SSS(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
+    RegisterInfoArray *reg_array;
     char *name;
     int remote;
 
@@ -220,22 +207,30 @@ static void zynqmp_csu_sss_init(Object *obj)
         name = g_strdup_printf("stream-connected-%s",
                                zynqmp_csu_sss_remote_names[remote]);
         object_property_add_link(OBJECT(s), name, TYPE_STREAM_SLAVE,
-                                 (Object **)&p->tx_devs[remote],
-                                 qdev_prop_allow_set_link_before_realize,
-                                 OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                                 NULL);
+                             (Object **)&p->tx_devs[remote],
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
         g_free(name);
         object_initialize(&p->rx_devs[remote], sizeof(SSSStream),
                           TYPE_SSS_STREAM);
         name = g_strdup_printf("stream-connected-%s-target",
                                zynqmp_csu_sss_remote_names[remote]);
         object_property_add_child(OBJECT(s), name,
-                                 (Object *)&p->rx_devs[remote], &error_abort);
+                                 (Object *)&p->rx_devs[remote]);
         g_free(name);
     }
 
-    memory_region_init_io(&s->iomem, obj, &sss_ops, s,
-                          "zynqmp.csu-stream-switch", R_MAX * 4);
+    memory_region_init(&s->iomem, obj, TYPE_ZYNQMP_CSU_SSS, R_MAX * 4);
+    reg_array =
+        register_init_block32(DEVICE(obj), zynqmp_csu_sss_regs_info,
+                              ARRAY_SIZE(zynqmp_csu_sss_regs_info),
+                              s->regs_info, s->regs,
+                              &sss_ops,
+                              ZYNQMP_CSU_SSS_ERR_DEBUG,
+                              R_MAX * 4);
+    memory_region_add_subregion(&s->iomem,
+                                0x0,
+                                &reg_array->mem);
     sysbus_init_mmio(sbd, &s->iomem);
 }
 

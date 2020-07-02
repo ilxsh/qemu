@@ -31,11 +31,12 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/qdev.h"
-#include "hw/hw.h"
+#include "qemu/units.h"
+#include "hw/irq.h"
 #include "hw/registerfields.h"
 #include "sysemu/block-backend.h"
 #include "hw/sd/sd.h"
+#include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/bitmap.h"
 #include "qemu/cutils.h"
@@ -43,6 +44,7 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
+#include "qemu/module.h"
 #include "sdmmc-internal.h"
 #include "trace.h"
 
@@ -146,7 +148,7 @@ static const char *sd_state_name(enum SDCardStates state)
     if (state == sd_inactive_state) {
         return "inactive";
     }
-    assert(state <= ARRAY_SIZE(state_name));
+    assert(state < ARRAY_SIZE(state_name));
     return state_name[state];
 }
 
@@ -167,7 +169,7 @@ static const char *sd_response_name(sd_rsp_type_t rsp)
     if (rsp == sd_r1b) {
         rsp = sd_r1;
     }
-    assert(rsp <= ARRAY_SIZE(response_name));
+    assert(rsp < ARRAY_SIZE(response_name));
     return response_name[rsp];
 }
 
@@ -307,7 +309,7 @@ static void sd_ocr_powerup(void *opaque)
     /* card power-up OK */
     sd->ocr = FIELD_DP32(sd->ocr, OCR, CARD_POWER_UP, 1);
 
-    if (!sd->mmc && sd->size > 1 * G_BYTE) {
+    if (!sd->mmc && sd->size > 1 * GiB) {
         sd->ocr = FIELD_DP32(sd->ocr, OCR, CARD_CAPACITY, 1);
     }
 }
@@ -386,7 +388,7 @@ static void sd_set_csd(SDState *sd, uint64_t size)
     uint32_t sectsize = (1 << (SECTOR_SHIFT + 1)) - 1;
     uint32_t wpsize = (1 << (WPGROUP_SHIFT + 1)) - 1;
 
-    if (size <= 1 * G_BYTE) { /* Standard Capacity SD */
+    if (size <= 1 * GiB) { /* Standard Capacity SD */
         sd->csd[0] = 0x00;	/* CSD structure */
         sd->csd[1] = 0x26;	/* Data read access-time-1 */
         sd->csd[2] = 0x00;	/* Data read access-time-2 */
@@ -412,7 +414,7 @@ static void sd_set_csd(SDState *sd, uint64_t size)
             ((HWBLOCK_SHIFT << 6) & 0xc0);
         sd->csd[14] = 0x00;	/* File format group */
     } else {			/* SDHC */
-        size /= 512 * 1024;
+        size /= 512 * KiB;
         size -= 1;
         sd->csd[0] = 0x40;
         sd->csd[1] = 0x0e;
@@ -713,13 +715,13 @@ SDState *sd_init(BlockBackend *blk, bool is_spi)
     dev = DEVICE(obj);
     qdev_prop_set_drive(dev, "drive", blk, &err);
     if (err) {
-        error_report("sd_init failed: %s", error_get_pretty(err));
+        error_reportf_err(err, "sd_init failed: ");
         return NULL;
     }
     qdev_prop_set_bit(dev, "spi", is_spi);
     object_property_set_bool(obj, true, "realized", &err);
     if (err) {
-        error_report("sd_init failed: %s", error_get_pretty(err));
+        error_reportf_err(err, "sd_init failed: ");
         return NULL;
     }
 
@@ -974,9 +976,10 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             sd_ocr_powerup(sd);
             return sd->state == sd_idle_state ?
                    sd_r3 : sd_r0;
-        } else if (!sd->spi) {
-            goto bad_cmd;
         }
+
+        if (!sd->spi)
+            goto bad_cmd;
 
         sd->state = sd_transfer_state;
         return sd_r1;
@@ -998,8 +1001,8 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
         }
         break;
 
-    case 3:    /* CMD3:   SD: SEND_RELATIVE_ADDR
-                          MMC: SET_RELATEIVE_ADDR */
+    case 3:	/* CMD3:   SEND_RELATIVE_ADDR */
+                /*         MMC: SET_RELATEIVE_ADDR */
         if (sd->spi)
             goto bad_cmd;
         switch (sd->state) {
@@ -1038,13 +1041,14 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
                 mmc_function_switch(sd, req.arg);
                 sd->state = sd_transfer_state;
                 return sd_r1b;
-            } else {
-                sd_function_switch(sd, req.arg);
-                sd->state = sd_sendingdata_state;
-                sd->data_start = 0;
-                sd->data_offset = 0;
-                return sd_r1;
             }
+
+            sd_function_switch(sd, req.arg);
+            sd->state = sd_sendingdata_state;
+            sd->data_start = 0;
+            sd->data_offset = 0;
+            return sd_r1;
+
         default:
             break;
         }
@@ -1098,25 +1102,25 @@ static sd_rsp_type_t sd_normal_command(SDState *sd, SDRequest req)
             sd->data_start = 0;
             sd->data_offset = 0;
             return sd_r1;
-        } else {
-            if (sd->spec_version < SD_PHY_SPECv2_00_VERS) {
-                break;
-            }
-            if (sd->state != sd_idle_state) {
-                break;
-            }
-
-            sd->vhs = 0;
-
-            /* No response if not exactly one VHS bit is set.  */
-            if (!(req.arg >> 8) || (req.arg >> (ctz32(req.arg & ~0xff) + 1))) {
-                return sd->spi ? sd_r7 : sd_r0;
-            }
-
-            /* Accept.  */
-            sd->vhs = req.arg;
-            return sd_r7;
         }
+
+        if (sd->spec_version < SD_PHY_SPECv2_00_VERS) {
+            break;
+        }
+        if (sd->state != sd_idle_state) {
+            break;
+        }
+        sd->vhs = 0;
+
+        /* No response if not exactly one VHS bit is set.  */
+        if (!(req.arg >> 8) || (req.arg >> (ctz32(req.arg & ~0xff) + 1))) {
+            return sd->spi ? sd_r7 : sd_r0;
+        }
+
+        /* Accept.  */
+        sd->vhs = req.arg;
+        return sd_r7;
+
     case 9:	/* CMD9:   SEND_CSD */
         switch (sd->state) {
         case sd_standby_state:
@@ -2125,9 +2129,6 @@ uint8_t sd_read_data(SDState *sd)
         break;
 
     case 21:    /* CMD21: SEND_TUNNING_BLOCK (MMC) */
-        if (sd->data_offset >= MMC_TUNING_BLOCK_SIZE - 1) {
-            sd->state = sd_transfer_state;
-        }
         if (sd->ext_csd[EXCSD_BUS_WIDTH_OFFSET] & BUS_WIDTH_8_MASK) {
             ret = mmc_tunning_block_pattern[sd->data_offset++];
         } else {
@@ -2136,6 +2137,9 @@ uint8_t sd_read_data(SDState *sd)
              */
             ret = mmc_tunning_block_pattern[sd->data_offset++] & 0x0F;
             ret |= (mmc_tunning_block_pattern[sd->data_offset++] & 0x0F) << 4;
+        }
+        if (sd->data_offset >= MMC_TUNING_BLOCK_SIZE - 1) {
+            sd->state = sd_transfer_state;
         }
         break;
 
@@ -2253,10 +2257,11 @@ static void sd_class_init(ObjectClass *klass, void *data)
     SDCardClass *sc = SD_CARD_CLASS(klass);
 
     dc->realize = sd_realize;
-    dc->props = sd_properties;
+    device_class_set_props(dc, sd_properties);
     dc->vmsd = &sd_vmstate;
     dc->reset = sd_reset;
     dc->bus_type = TYPE_SD_BUS;
+    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 
     sc->set_voltage = sd_set_voltage;
     sc->get_dat_lines = sd_get_dat_lines;

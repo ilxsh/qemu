@@ -14,9 +14,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/dealloc-visitor.h"
-#include "qemu/queue.h"
-#include "qemu-common.h"
-#include "qapi/qmp/types.h"
+#include "qapi/qmp/qnull.h"
 #include "qapi/visitor-impl.h"
 
 struct QapiDeallocVisitor
@@ -34,12 +32,6 @@ static void qapi_dealloc_end_struct(Visitor *v, void **obj)
     if (obj) {
         g_free(*obj);
     }
-}
-
-static void qapi_dealloc_start_alternate(Visitor *v, const char *name,
-                                         GenericAlternate **obj, size_t size,
-                                         Error **errp)
-{
 }
 
 static void qapi_dealloc_end_alternate(Visitor *v, void **obj)
@@ -99,7 +91,7 @@ static void qapi_dealloc_type_anything(Visitor *v, const char *name,
                                        QObject **obj, Error **errp)
 {
     if (obj) {
-        qobject_decref(*obj);
+        qobject_unref(*obj);
     }
 }
 
@@ -107,7 +99,7 @@ static void qapi_dealloc_type_null(Visitor *v, const char *name,
                                    QNull **obj, Error **errp)
 {
     if (obj) {
-        QDECREF(*obj);
+        qobject_unref(*obj);
     }
 }
 
@@ -125,7 +117,6 @@ Visitor *qapi_dealloc_visitor_new(void)
     v->visitor.type = VISITOR_DEALLOC;
     v->visitor.start_struct = qapi_dealloc_start_struct;
     v->visitor.end_struct = qapi_dealloc_end_struct;
-    v->visitor.start_alternate = qapi_dealloc_start_alternate;
     v->visitor.end_alternate = qapi_dealloc_end_alternate;
     v->visitor.start_list = qapi_dealloc_start_list;
     v->visitor.next_list = qapi_dealloc_next_list;

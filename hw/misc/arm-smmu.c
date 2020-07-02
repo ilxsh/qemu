@@ -33,6 +33,8 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "sysemu/dma.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "hw/fdt_generic_util.h"
 
@@ -1352,6 +1354,11 @@ static void smmu_ptw64(SMMU *s, unsigned int cb, TransReq *req)
         break;
     }
 
+    outputsize = outsize_map[ps];
+    if (outputsize > s->cfg.pamax) {
+        outputsize = s->cfg.pamax;
+    }
+
     stride = grainsize - 3;
     if (req->stage == 1) {
         if (grainsize < 16 && (inputsize > (grainsize + 3 * stride))) {
@@ -1375,15 +1382,10 @@ static void smmu_ptw64(SMMU *s, unsigned int cb, TransReq *req)
             level = 2 - startlevel;
         }
 
-        ok = check_s2_startlevel(true, 40, level, inputsize, stride);
+        ok = check_s2_startlevel(true, outputsize, level, inputsize, stride);
         if (!ok) {
             goto do_fault;
         }
-    }
-
-    outputsize = outsize_map[ps];
-    if (outputsize > s->cfg.pamax) {
-        outputsize = s->cfg.pamax;
     }
 
     baselowerbound = 3 + inputsize - ((3 - level) * stride + grainsize);
@@ -1683,9 +1685,21 @@ static void smmu_nscr0_pw(RegisterInfo *reg, uint64_t val)
     s->regs[R_SMMU_NSCR0] = val;
 }
 
+static int smmu_attrs_to_index(IOMMUMemoryRegion *iommu, MemTxAttrs attrs)
+{
+    uint16_t master_id = attrs.requester_id & 0xffff;
+
+    return (master_id << 1) | attrs.secure;
+}
+
+static int smmu_num_indexes(IOMMUMemoryRegion *iommu)
+{
+    return (1 << 17) - 1;
+}
+
 static IOMMUTLBEntry smmu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
-                                    bool is_write,
-                                    MemTxAttrs *attr)
+                                    IOMMUAccessFlags flags, int iommu_idx)
+
 {
     TBU *tbu = container_of(mr, TBU, iommu);
     SMMU *s = tbu->smmu;
@@ -1700,7 +1714,7 @@ static IOMMUTLBEntry smmu_translate(IOMMUMemoryRegion *mr, hwaddr addr,
     hwaddr pa = va;
     int prot;
     bool err = false;
-    uint64_t master_id = attr->requester_id;
+    uint16_t master_id = iommu_idx >> 1;
     bool clientpd = ARRAY_FIELD_EX32(s->regs, SMMU_SCR0, CLIENTPD);
 
     if (clientpd) {
@@ -2233,16 +2247,14 @@ static void smmu500_init(Object *obj)
     object_property_add_link(obj, "dma", TYPE_MEMORY_REGION,
                              (Object **)&s->dma_mr,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
 
     for (i = 0; i < MAX_TBU; i++) {
         char *name = g_strdup_printf("mr-%d", i);
         object_property_add_link(obj, name, TYPE_MEMORY_REGION,
-                                 (Object **)&s->tbu[i].mr,
-                                 qdev_prop_allow_set_link_before_realize,
-                                 OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                                 &error_abort);
+                             (Object **)&s->tbu[i].mr,
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
         g_free(name);
         s->tbu[i].smmu = s;
     }
@@ -2324,7 +2336,7 @@ static void smmu500_class_init(ObjectClass *klass, void *data)
     dc->reset = smmu500_reset;
     dc->realize = smmu500_realize;
     dc->vmsd = &vmstate_smmu500;
-    dc->props = smmu_properties;
+    device_class_set_props(dc, smmu_properties);
     fmc->parse_reg = smmu_parse_reg;
 }
 
@@ -2333,7 +2345,9 @@ static void smmu500_iommu_memory_region_class_init(ObjectClass *klass,
 {
     IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
 
-    imrc->translate_attr = smmu_translate;
+    imrc->translate = smmu_translate;
+    imrc->attrs_to_index = smmu_attrs_to_index;
+    imrc->num_indexes = smmu_num_indexes;
 }
 
 static const TypeInfo smmu500_info = {

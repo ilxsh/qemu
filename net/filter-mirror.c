@@ -12,10 +12,7 @@
 #include "qemu/osdep.h"
 #include "net/filter.h"
 #include "net/net.h"
-#include "qemu-common.h"
 #include "qapi/error.h"
-#include "qapi/qmp/qerror.h"
-#include "qapi-visit.h"
 #include "qom/object.h"
 #include "qemu/main-loop.h"
 #include "qemu/error-report.h"
@@ -135,7 +132,7 @@ static void redirector_chr_read(void *opaque, const uint8_t *buf, int size)
     }
 }
 
-static void redirector_chr_event(void *opaque, int event)
+static void redirector_chr_event(void *opaque, QEMUChrEvent event)
 {
     NetFilterState *nf = opaque;
     MirrorState *s = FILTER_REDIRECTOR(nf);
@@ -395,12 +392,12 @@ static void filter_mirror_init(Object *obj)
     MirrorState *s = FILTER_MIRROR(obj);
 
     object_property_add_str(obj, "outdev", filter_mirror_get_outdev,
-                            filter_mirror_set_outdev, NULL);
+                            filter_mirror_set_outdev);
 
     s->vnet_hdr = false;
     object_property_add_bool(obj, "vnet_hdr_support",
                              filter_mirror_get_vnet_hdr,
-                             filter_mirror_set_vnet_hdr, NULL);
+                             filter_mirror_set_vnet_hdr);
 }
 
 static void filter_redirector_init(Object *obj)
@@ -408,14 +405,14 @@ static void filter_redirector_init(Object *obj)
     MirrorState *s = FILTER_REDIRECTOR(obj);
 
     object_property_add_str(obj, "indev", filter_redirector_get_indev,
-                            filter_redirector_set_indev, NULL);
+                            filter_redirector_set_indev);
     object_property_add_str(obj, "outdev", filter_redirector_get_outdev,
-                            filter_redirector_set_outdev, NULL);
+                            filter_redirector_set_outdev);
 
     s->vnet_hdr = false;
     object_property_add_bool(obj, "vnet_hdr_support",
                              filter_redirector_get_vnet_hdr,
-                             filter_redirector_set_vnet_hdr, NULL);
+                             filter_redirector_set_vnet_hdr);
 }
 
 static void filter_mirror_fini(Object *obj)

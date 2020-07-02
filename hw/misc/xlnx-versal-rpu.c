@@ -30,6 +30,8 @@
 #include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "hw/fdt_generic_util.h"
 
@@ -41,6 +43,13 @@
 
 #define XILINX_VERSAL_RPU(obj) \
      OBJECT_CHECK(RPU, (obj), TYPE_XILINX_VERSAL_RPU)
+
+#define DPRINTF(...) do { \
+        if (XILINX_VERSAL_RPU_ERR_DEBUG) { \
+            qemu_log("%s: ", __func__); \
+            qemu_log(__VA_ARGS__); \
+        } \
+    } while (0)
 
 REG32(RPU_GLBL_CNTL, 0x0)
     FIELD(RPU_GLBL_CNTL, GIC_AXPROT, 10, 1)
@@ -450,7 +459,7 @@ static void rpu_setup_tcm(RPU *s)
     sl_split = ARRAY_FIELD_EX32(s->regs, RPU_GLBL_CNTL, SLSPLIT);
     tcm_combine = ARRAY_FIELD_EX32(s->regs, RPU_GLBL_CNTL, TCM_COMB);
 
-    qemu_log("%s: sl_clamp=%d sl_split=%d tcm_combine=%d\n",
+    DPRINTF("%s: sl_clamp=%d sl_split=%d tcm_combine=%d\n",
              __func__, sl_clamp, sl_split, tcm_combine);
 
     if (tcm_combine) {
@@ -819,10 +828,9 @@ static void rpu_init(Object *obj)
     for (i = 0; i < MAX_RPU; i++) {
         name = g_strdup_printf("rpu%d", i);
         object_property_add_link(obj, name, TYPE_DEVICE,
-                                 (Object **)&s->rpu_cpu[i],
-                                 qdev_prop_allow_set_link_before_realize,
-                                 OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                                 &error_abort);
+                             (Object **)&s->rpu_cpu[i],
+                             qdev_prop_allow_set_link_before_realize,
+                             OBJ_PROP_LINK_STRONG);
         g_free(name);
     }
 }
@@ -864,7 +872,7 @@ static void rpu_class_init(ObjectClass *klass, void *data)
     dc->reset = rpu_reset;
     dc->realize = rpu_realize;
     dc->vmsd = &vmstate_rpu;
-    dc->props = rpu_properties;
+    device_class_set_props(dc, rpu_properties);
     fggc->controller_gpios = crl_gpios;
 }
 

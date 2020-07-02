@@ -13,14 +13,19 @@
 #include "cpu.h"
 #include "qapi/qmp/qerror.h"
 #include "qapi/qmp/qjson.h"
-#include "qmp-commands.h"
+#include "qapi/qapi-commands-ui.h"
+#include "qapi/qapi-events-ui.h"
+#include "qapi/qapi-events-injection.h"
+#include "qapi/error.h"
+#include "qapi/qapi-types-injection.h"
+#include "qapi/qapi-commands-injection.h"
 #include "qemu/timer.h"
-#include "qapi-event.h"
 #include "exec/memory.h"
-#include "qom/cpu.h"
+#include "hw/irq.h"
 #include "qemu/log.h"
 #include "qemu/queue.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/runstate.h"
 #include "exec/exec-all.h"
 
 typedef struct FaultEventEntry FaultEventEntry;
@@ -56,8 +61,7 @@ void qmp_write_mem(int64_t addr, int64_t val, int64_t size, bool has_cpu,
                     " ld size=%"PRId64" cpu_path=%s (cpu=%d)\n", addr, val,
                     size, qom, cpu_id);
         } else {
-            error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
-                            "'%s' is not a CPU or doesn't exists", qom);
+            error_setg(errp, "'%s' is not a CPU or doesn't exists", qom);
             DPRINTF("write memory failed.\n");
             return;
         }
@@ -95,8 +99,7 @@ ReadValue *qmp_read_mem(int64_t addr, int64_t size, bool has_cpu, int64_t cpu,
             DPRINTF("read memory addr=0x%" PRIx64 " size=%"PRId64" cpu_path=%s"
                     " (cpu=%d)\n", addr, size, qom, cpu_id);
         } else {
-            error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
-                            "'%s' is not a CPU or doesn't exists", qom);
+            error_setg(errp, "'%s' is not a CPU or doesn't exists", qom);
             DPRINTF("read memory failed.\n");
             return ret;
         }
@@ -154,7 +157,7 @@ static void do_fault(void *opaque)
         if (entry->time_ns < current_time) {
             DPRINTF("fault %"PRId64" happened @%"PRId64"!\n", entry->val,
                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-            qapi_event_send_fault_event(entry->val, current_time, &error_abort);
+            qapi_event_send_fault_event(entry->val, current_time);
             QLIST_REMOVE(entry, node);
             g_free(entry);
             vm_stop_from_timer(RUN_STATE_DEBUG);
@@ -190,15 +193,13 @@ void qmp_inject_gpio(const char *device_name, bool has_gpio, const char *gpio,
 
     dev = DEVICE(object_resolve_path(device_name, NULL));
     if (!dev) {
-        error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
-                  "Device '%s' is not a device", device_name);
+        error_setg(errp, "Device '%s' is not a device", device_name);
         return;
     }
 
     irq = qdev_get_gpio_in_named(dev, has_gpio ? gpio : NULL, num);
     if (!irq) {
-        error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
-                  "GPIO '%s' doesn't exists", has_gpio ? gpio : "unnammed");
+        error_setg(errp, "GPIO '%s' doesn't exists", has_gpio ? gpio : "unnammed");
         return;
     }
 

@@ -27,6 +27,8 @@
 #include "hw/sysbus.h"
 #include "hw/register.h"
 #include "qemu/log.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 #include "hw/fdt_generic_util.h"
 
 #ifndef XILINX_IO_MODULE_INTC_ERR_DEBUG
@@ -346,7 +348,7 @@ static void xlx_iom_class_init(ObjectClass *klass, void *data)
 
     dc->reset = iom_intc_reset;
     dc->realize = xlx_iom_realize;
-    dc->props = xlx_iom_properties;
+    device_class_set_props(dc, xlx_iom_properties);
     dc->vmsd = &vmstate_xlx_iom;
     fgic->get_irq = xilinx_iom_fdt_get_irq;
 }

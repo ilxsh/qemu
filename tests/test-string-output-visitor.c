@@ -15,9 +15,7 @@
 #include "qemu-common.h"
 #include "qapi/error.h"
 #include "qapi/string-output-visitor.h"
-#include "test-qapi-types.h"
 #include "test-qapi-visit.h"
-#include "qapi/qmp/types.h"
 
 typedef struct TestOutputVisitorData {
     Visitor *ov;
@@ -97,7 +95,7 @@ static void test_visitor_out_intList(TestOutputVisitorData *data,
     Error *err = NULL;
     char *str;
 
-    for (i = 0; i < sizeof(value) / sizeof(value[0]); i++) {
+    for (i = 0; i < ARRAY_SIZE(value); i++) {
         *tmp = g_malloc0(sizeof(**tmp));
         (*tmp)->value = value[i];
         tmp = &(*tmp)->next;
@@ -205,19 +203,6 @@ static void test_visitor_out_enum(TestOutputVisitorData *data,
     }
 }
 
-static void test_visitor_out_enum_errors(TestOutputVisitorData *data,
-                                         const void *unused)
-{
-    EnumOne i, bad_values[] = { ENUM_ONE__MAX, -1 };
-    Error *err;
-
-    for (i = 0; i < ARRAY_SIZE(bad_values) ; i++) {
-        err = NULL;
-        visit_type_EnumOne(data->ov, "unused", &bad_values[i], &err);
-        error_free_or_abort(&err);
-    }
-}
-
 static void
 output_visitor_test_add(const char *testpath,
                         TestOutputVisitorData *data,
@@ -262,12 +247,6 @@ int main(int argc, char **argv)
                             &out_visitor_data, test_visitor_out_enum, false);
     output_visitor_test_add("/string-visitor/output/enum-human",
                             &out_visitor_data, test_visitor_out_enum, true);
-    output_visitor_test_add("/string-visitor/output/enum-errors",
-                            &out_visitor_data, test_visitor_out_enum_errors,
-                            false);
-    output_visitor_test_add("/string-visitor/output/enum-errors-human",
-                            &out_visitor_data, test_visitor_out_enum_errors,
-                            true);
     output_visitor_test_add("/string-visitor/output/intList",
                             &out_visitor_data, test_visitor_out_intList, false);
     output_visitor_test_add("/string-visitor/output/intList-human",

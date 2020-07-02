@@ -16,7 +16,12 @@ the COPYING file in the top-level directory.
 import ctypes
 import struct
 
-UINTPTR_T = gdb.lookup_type("uintptr_t")
+try:
+    UINTPTR_T = gdb.lookup_type("uintptr_t")
+except Exception as inst:
+    raise gdb.GdbError("Symbols must be loaded prior to sourcing dump-guest-memory.\n"
+                       "Symbols may be loaded by 'attach'ing a QEMU process id or by "
+                       "'load'ing a QEMU binary.")
 
 TARGET_PAGE_SIZE = 0x1000
 TARGET_PAGE_MASK = 0xFFFFFFFFFFFFF000
@@ -157,13 +162,14 @@ class ELF(object):
         phdr = get_arch_phdr(self.endianness, self.elfclass)
         phdr.p_type = p_type
         phdr.p_paddr = p_paddr
+        phdr.p_vaddr = p_paddr
         phdr.p_filesz = p_size
         phdr.p_memsz = p_size
         self.segments.append(phdr)
         self.ehdr.e_phnum += 1
 
     def to_file(self, elf_file):
-        """Writes all ELF structures to the the passed file.
+        """Writes all ELF structures to the passed file.
 
         Structure:
         Ehdr
@@ -411,7 +417,9 @@ def get_guest_phys_blocks():
         memory_region = flat_range["mr"].dereference()
 
         # we only care about RAM
-        if not memory_region["ram"]:
+        if (not memory_region["ram"] or
+            memory_region["ram_device"] or
+            memory_region["nonvolatile"]):
             continue
 
         section_size = int128_get64(flat_range["addr"]["size"])
@@ -546,8 +554,9 @@ shape and this command should mostly work."""
         return None
 
     def add_vmcoreinfo(self):
-        vmci = '(VMCoreInfoState *)' + \
-               'object_resolve_path_type("", "vmcoreinfo", 0)'
+        if gdb.lookup_symbol("vmcoreinfo_realize")[0] is None:
+            return
+        vmci = 'vmcoreinfo_realize::vmcoreinfo_state'
         if not gdb.parse_and_eval("%s" % vmci) \
            or not gdb.parse_and_eval("(%s)->has_vmcoreinfo" % vmci):
             return
@@ -565,7 +574,7 @@ shape and this command should mostly work."""
 
         vmcoreinfo = self.phys_memory_read(addr, size)
         if vmcoreinfo:
-            self.elf.add_vmcoreinfo_note(vmcoreinfo.tobytes())
+            self.elf.add_vmcoreinfo_note(bytes(vmcoreinfo))
 
     def invoke(self, args, from_tty):
         """Handles command invocation from gdb."""

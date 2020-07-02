@@ -9,11 +9,14 @@
 
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
+#include "migration/vmstate.h"
+#include "hw/irq.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci/pci_host.h"
-#include "exec/address-spaces.h"
+#include "hw/qdev-properties.h"
 #include "qemu/log.h"
+#include "qemu/module.h"
 
 /* Old and buggy versions of QEMU used the wrong mapping from
  * PCI IRQs to system interrupt lines. Unfortunately the Linux
@@ -311,7 +314,7 @@ static const MemoryRegionOps pci_vpb_config_ops = {
 
 static int pci_vpb_map_irq(PCIDevice *d, int irq_num)
 {
-    PCIVPBState *s = container_of(d->bus, PCIVPBState, pci_bus);
+    PCIVPBState *s = container_of(pci_get_bus(d), PCIVPBState, pci_bus);
 
     if (s->irq_mapping == PCI_VPB_IRQMAP_BROKEN) {
         /* Legacy broken IRQ mapping for compatibility with old and
@@ -399,9 +402,9 @@ static void pci_vpb_realize(DeviceState *dev, Error **errp)
     memory_region_init(&s->pci_io_space, OBJECT(s), "pci_io", 1ULL << 32);
     memory_region_init(&s->pci_mem_space, OBJECT(s), "pci_mem", 1ULL << 32);
 
-    pci_bus_new_inplace(&s->pci_bus, sizeof(s->pci_bus), dev, "pci",
-                        &s->pci_mem_space, &s->pci_io_space,
-                        PCI_DEVFN(11, 0), TYPE_PCI_BUS);
+    pci_root_bus_new_inplace(&s->pci_bus, sizeof(s->pci_bus), dev, "pci",
+                             &s->pci_mem_space, &s->pci_io_space,
+                             PCI_DEVFN(11, 0), TYPE_PCI_BUS);
     h->bus = &s->pci_bus;
 
     object_initialize(&s->pci_dev, sizeof(s->pci_dev), TYPE_VERSATILE_PCI_HOST);
@@ -506,7 +509,7 @@ static void pci_vpb_class_init(ObjectClass *klass, void *data)
     dc->realize = pci_vpb_realize;
     dc->reset = pci_vpb_reset;
     dc->vmsd = &pci_vpb_vmstate;
-    dc->props = pci_vpb_properties;
+    device_class_set_props(dc, pci_vpb_properties);
 }
 
 static const TypeInfo pci_vpb_info = {

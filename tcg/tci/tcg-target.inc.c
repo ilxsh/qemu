@@ -292,7 +292,7 @@ static const int tcg_target_reg_alloc_order[] = {
 #endif
 };
 
-#if MAX_OPC_PARAM_IARGS != 5
+#if MAX_OPC_PARAM_IARGS != 6
 # error Fix needed, number of supported input arguments changed!
 #endif
 
@@ -305,14 +305,16 @@ static const int tcg_target_call_iarg_regs[] = {
     TCG_REG_R4,
 #endif
     TCG_REG_R5,
+    TCG_REG_R6,
 #if TCG_TARGET_REG_BITS == 32
     /* 32 bit hosts need 2 * MAX_OPC_PARAM_IARGS registers. */
-    TCG_REG_R6,
     TCG_REG_R7,
 #if TCG_TARGET_NB_REGS >= 16
     TCG_REG_R8,
     TCG_REG_R9,
     TCG_REG_R10,
+    TCG_REG_R11,
+    TCG_REG_R12,
 #else
 # error Too few input registers available
 #endif
@@ -367,7 +369,7 @@ static const char *const tcg_target_reg_names[TCG_TARGET_NB_REGS] = {
 };
 #endif
 
-static void patch_reloc(tcg_insn_unit *code_ptr, int type,
+static bool patch_reloc(tcg_insn_unit *code_ptr, int type,
                         intptr_t value, intptr_t addend)
 {
     /* tcg_out_reloc always uses the same type, addend. */
@@ -379,6 +381,7 @@ static void patch_reloc(tcg_insn_unit *code_ptr, int type,
     } else {
         tcg_patch64(code_ptr, value);
     }
+    return true;
 }
 
 /* Parse target specific constraints. */
@@ -506,7 +509,7 @@ static void tcg_out_ld(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg1,
     old_code_ptr[1] = s->code_ptr - old_code_ptr;
 }
 
-static void tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg)
+static bool tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg)
 {
     uint8_t *old_code_ptr = s->code_ptr;
     tcg_debug_assert(ret != arg);
@@ -518,6 +521,7 @@ static void tcg_out_mov(TCGContext *s, TCGType type, TCGReg ret, TCGReg arg)
     tcg_out_r(s, ret);
     tcg_out_r(s, arg);
     old_code_ptr[1] = s->code_ptr - old_code_ptr;
+    return true;
 }
 
 static void tcg_out_movi(TCGContext *s, TCGType type,
@@ -572,7 +576,7 @@ static void tcg_out_op(TCGContext *s, TCGOpcode opc, const TCGArg *args,
             /* Indirect jump method. */
             TODO();
         }
-        s->tb_jmp_reset_offset[args[0]] = tcg_current_code_size(s);
+        set_jmp_reset_offset(s, args[0]);
         break;
     case INDEX_op_br:
         tci_out_label(s, arg_label(args[0]));

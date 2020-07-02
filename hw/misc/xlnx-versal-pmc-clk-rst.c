@@ -31,7 +31,10 @@
 #include "qemu/bitops.h"
 #include "qemu/log.h"
 #include "qemu/config-file.h"
+#include "qemu/option.h"
 #include "sysemu/sysemu.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #include "hw/fdt_generic_util.h"
 
@@ -580,9 +583,9 @@ static void crp_update_gpios(CRP *s)
     PROPAGATE_GPIO(RST_SYSMON, CFG_RST, s->rst_sysmon_cfg);
     PROPAGATE_GPIO(RST_SYSMON, SEQ_RST, s->rst_sysmon_seq);
     PROPAGATE_GPIO(RST_PL, RESET0, s->rst_pl[0]);
-    PROPAGATE_GPIO(RST_PL, RESET1, s->rst_pl[0]);
-    PROPAGATE_GPIO(RST_PL, RESET2, s->rst_pl[0]);
-    PROPAGATE_GPIO(RST_PL, RESET3, s->rst_pl[0]);
+    PROPAGATE_GPIO(RST_PL, RESET1, s->rst_pl[1]);
+    PROPAGATE_GPIO(RST_PL, RESET2, s->rst_pl[2]);
+    PROPAGATE_GPIO(RST_PL, RESET3, s->rst_pl[3]);
     PROPAGATE_GPIO(RST_USB, PHY_RST, s->rst_usb);
     PROPAGATE_GPIO(RST_DBG, RESET, s->rst_dbg);
     PROPAGATE_GPIO(RST_DBG, DPC, s->rst_dbg_dpc);
@@ -859,7 +862,6 @@ static void crp_reset(DeviceState *dev)
         }
         switch (addr) {
         case A_RESET_REASON:
-        case A_RST_PS:
             continue;
         default:
             register_reset(&s->regs_info[i]);

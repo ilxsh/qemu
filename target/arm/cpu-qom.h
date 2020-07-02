@@ -20,7 +20,7 @@
 #ifndef QEMU_ARM_CPU_QOM_H
 #define QEMU_ARM_CPU_QOM_H
 
-#include "qom/cpu.h"
+#include "hw/core/cpu.h"
 
 struct arm_boot_info;
 
@@ -35,6 +35,17 @@ struct arm_boot_info;
 #define ARM_CPU_PARENT_CLASS \
     object_class_get_parent(object_class_by_name(TYPE_ARM_CPU))
 
+#define TYPE_ARM_MAX_CPU "max-" TYPE_ARM_CPU
+
+typedef struct ARMCPUInfo {
+    const char *name;
+    void (*initfn)(Object *obj);
+    void (*class_init)(ObjectClass *oc, void *data);
+} ARMCPUInfo;
+
+void arm_cpu_register(const ARMCPUInfo *info);
+void aarch64_cpu_register(const ARMCPUInfo *info);
+
 /**
  * ARMCPUClass:
  * @parent_realize: The parent class' realize handler.
@@ -47,8 +58,9 @@ typedef struct ARMCPUClass {
     CPUClass parent_class;
     /*< public >*/
 
+    const ARMCPUInfo *info;
     DeviceRealize parent_realize;
-    void (*parent_reset)(CPUState *cpu);
+    DeviceReset parent_reset;
 } ARMCPUClass;
 
 typedef struct ARMCPU ARMCPU;
@@ -73,6 +85,7 @@ void arm_gt_ptimer_cb(void *opaque);
 void arm_gt_vtimer_cb(void *opaque);
 void arm_gt_htimer_cb(void *opaque);
 void arm_gt_stimer_cb(void *opaque);
+void arm_gt_hvtimer_cb(void *opaque);
 
 #define ARM_AFF0_SHIFT 0
 #define ARM_AFF0_MASK  (0xFFULL << ARM_AFF0_SHIFT)

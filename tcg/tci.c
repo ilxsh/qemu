@@ -30,7 +30,7 @@
 #include "qemu-common.h"
 #include "tcg/tcg.h"           /* MAX_OPC_PARAM_IARGS */
 #include "exec/cpu_ldst.h"
-#include "tcg-op.h"
+#include "tcg/tcg-op.h"
 
 /* Marker for missing code. */
 #define TODO() \
@@ -40,7 +40,7 @@
         tcg_abort(); \
     } while (0)
 
-#if MAX_OPC_PARAM_IARGS != 5
+#if MAX_OPC_PARAM_IARGS != 6
 # error Fix needed, number of supported input arguments changed!
 #endif
 #if TCG_TARGET_REG_BITS == 32
@@ -48,11 +48,12 @@ typedef uint64_t (*helper_function)(tcg_target_ulong, tcg_target_ulong,
                                     tcg_target_ulong, tcg_target_ulong,
                                     tcg_target_ulong, tcg_target_ulong,
                                     tcg_target_ulong, tcg_target_ulong,
+                                    tcg_target_ulong, tcg_target_ulong,
                                     tcg_target_ulong, tcg_target_ulong);
 #else
 typedef uint64_t (*helper_function)(tcg_target_ulong, tcg_target_ulong,
                                     tcg_target_ulong, tcg_target_ulong,
-                                    tcg_target_ulong);
+                                    tcg_target_ulong, tcg_target_ulong);
 #endif
 
 static tcg_target_ulong tci_read_reg(const tcg_target_ulong *regs, TCGReg index)
@@ -122,6 +123,12 @@ tci_write_reg32s(tcg_target_ulong *regs, TCGReg index, int32_t value)
 #endif
 
 static void tci_write_reg8(tcg_target_ulong *regs, TCGReg index, uint8_t value)
+{
+    tci_write_reg(regs, index, value);
+}
+
+static void
+tci_write_reg16(tcg_target_ulong *regs, TCGReg index, uint16_t value)
 {
     tci_write_reg(regs, index, value);
 }
@@ -520,7 +527,9 @@ uintptr_t tcg_qemu_tb_exec(CPUArchState *env, uint8_t *tb_ptr)
                                           tci_read_reg(regs, TCG_REG_R7),
                                           tci_read_reg(regs, TCG_REG_R8),
                                           tci_read_reg(regs, TCG_REG_R9),
-                                          tci_read_reg(regs, TCG_REG_R10));
+                                          tci_read_reg(regs, TCG_REG_R10),
+                                          tci_read_reg(regs, TCG_REG_R11),
+                                          tci_read_reg(regs, TCG_REG_R12));
             tci_write_reg(regs, TCG_REG_R0, tmp64);
             tci_write_reg(regs, TCG_REG_R1, tmp64 >> 32);
 #else
@@ -528,7 +537,8 @@ uintptr_t tcg_qemu_tb_exec(CPUArchState *env, uint8_t *tb_ptr)
                                           tci_read_reg(regs, TCG_REG_R1),
                                           tci_read_reg(regs, TCG_REG_R2),
                                           tci_read_reg(regs, TCG_REG_R3),
-                                          tci_read_reg(regs, TCG_REG_R5));
+                                          tci_read_reg(regs, TCG_REG_R5),
+                                          tci_read_reg(regs, TCG_REG_R6));
             tci_write_reg(regs, TCG_REG_R0, tmp64);
 #endif
             break;
@@ -581,6 +591,8 @@ uintptr_t tcg_qemu_tb_exec(CPUArchState *env, uint8_t *tb_ptr)
             tci_write_reg8(regs, t0, *(uint8_t *)(t1 + t2));
             break;
         case INDEX_op_ld8s_i32:
+            TODO();
+            break;
         case INDEX_op_ld16u_i32:
             TODO();
             break;
@@ -850,7 +862,14 @@ uintptr_t tcg_qemu_tb_exec(CPUArchState *env, uint8_t *tb_ptr)
             tci_write_reg8(regs, t0, *(uint8_t *)(t1 + t2));
             break;
         case INDEX_op_ld8s_i64:
+            TODO();
+            break;
         case INDEX_op_ld16u_i64:
+            t0 = *tb_ptr++;
+            t1 = tci_read_r(regs, &tb_ptr);
+            t2 = tci_read_s32(&tb_ptr);
+            tci_write_reg16(regs, t0, *(uint16_t *)(t1 + t2));
+            break;
         case INDEX_op_ld16s_i64:
             TODO();
             break;

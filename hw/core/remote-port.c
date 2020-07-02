@@ -13,13 +13,15 @@
 #include "chardev/char.h"
 #include "sysemu/cpus.h"
 #include "hw/sysbus.h"
+#include "hw/hw.h"
 #include "hw/ptimer.h"
 #include "qemu/sockets.h"
 #include "qemu/thread.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
-#include "qom/cpu.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -93,7 +95,7 @@ int64_t rp_normalized_vmclk(RemotePort *s)
     return clk;
 }
 
-void rp_restart_sync_timer(RemotePort *s)
+static void rp_restart_sync_timer_bare(RemotePort *s)
 {
     if (!s->do_sync) {
         return;
@@ -104,6 +106,16 @@ void rp_restart_sync_timer(RemotePort *s)
         ptimer_set_limit(s->sync.ptimer, s->sync.quantum, 1);
         ptimer_run(s->sync.ptimer, 1);
     }
+}
+
+void rp_restart_sync_timer(RemotePort *s)
+{
+    if (s->doing_sync) {
+        return;
+    }
+    ptimer_transaction_begin(s->sync.ptimer);
+    rp_restart_sync_timer_bare(s);
+    ptimer_transaction_commit(s->sync.ptimer);
 }
 
 static void rp_fatal_error(RemotePort *s, const char *reason)
@@ -119,7 +131,7 @@ static ssize_t rp_recv(RemotePort *s, void *buf, size_t count)
 
     r = qemu_chr_fe_read_all(&s->chr, buf, count);
     if (r <= 0) {
-        rp_fatal_error(s, "Disconnected");
+        return r;
     }
     if (r != count) {
         error_report("%s: Bad read, expected %zd but got %zd\n",
@@ -150,10 +162,6 @@ static unsigned int rp_has_work(RemotePort *s)
 {
     unsigned int work = s->rx_queue.wpos - s->rx_queue.rpos;
     return work;
-}
-
-void rp_leave_iothread(RemotePort *s)
-{
 }
 
 /* Response handling.  */
@@ -213,10 +221,6 @@ RemotePortDynPkt rp_wait_resp(RemotePort *s)
     return s->rspqueue;
 }
 
-void rp_sync_vmclock(RemotePort *s, int64_t lclk, int64_t rclk)
-{
-}
-
 static void rp_cmd_hello(RemotePort *s, struct rp_pkt *pkt)
 {
     s->peer.version = pkt->hello.version;
@@ -259,9 +263,12 @@ static void rp_cmd_sync(RemotePort *s, struct rp_pkt *pkt)
 
     SYNCD(printf("%s: delayed sync resp - start diff=%ld (ts=%lu clk=%lu)\n",
           s->prefix, pkt->sync.timestamp - clk, pkt->sync.timestamp, clk));
+
+    ptimer_transaction_begin(s->sync.ptimer_resp);
     ptimer_set_limit(s->sync.ptimer_resp, diff, 1);
     ptimer_run(s->sync.ptimer_resp, 1);
     s->sync.resp_timer_enabled = true;
+    ptimer_transaction_commit(s->sync.ptimer_resp);
 }
 
 static void rp_say_hello(RemotePort *s)
@@ -301,15 +308,12 @@ static void syncresp_timer_hit(void *opaque)
     SYNCD(printf("%s: delayed sync response - send\n", s->prefix));
     rp_write(s, (void *) &s->sync.rsp, sizeof s->sync.rsp.sync);
     memset(&s->sync.rsp, 0, sizeof s->sync.rsp);
-
-    rp_leave_iothread(s);
 }
 
 static void sync_timer_hit(void *opaque)
 {
     RemotePort *s = REMOTE_PORT(opaque);
     int64_t clk;
-    int64_t rclk;
     RemotePortDynPkt rsp;
 
     clk = rp_normalized_vmclk(s);
@@ -317,12 +321,12 @@ static void sync_timer_hit(void *opaque)
         SYNCD(printf("%s: sync while delaying a resp! clk=%lu\n",
                      s->prefix, clk));
         s->sync.need_sync = true;
-        rp_restart_sync_timer(s);
-        rp_leave_iothread(s);
+        rp_restart_sync_timer_bare(s);
         return;
     }
 
     /* Sync.  */
+    s->doing_sync = true;
     s->sync.need_sync = false;
     qemu_mutex_lock(&s->rsp_mutex);
     /* Send the sync.  */
@@ -330,12 +334,11 @@ static void sync_timer_hit(void *opaque)
 
     SYNCD(printf("%s: syncing wait for resp %lu\n", s->prefix, clk));
     rsp = rp_wait_resp(s);
-    rclk = rsp.pkt->sync.timestamp;
     rp_dpkt_invalidate(&rsp);
     qemu_mutex_unlock(&s->rsp_mutex);
+    s->doing_sync = false;
 
-    rp_sync_vmclock(s, clk, rclk);
-    rp_restart_sync_timer(s);
+    rp_restart_sync_timer_bare(s);
 }
 
 static char *rp_sanitize_prefix(RemotePort *s)
@@ -358,8 +361,8 @@ static char *rp_autocreate_chardesc(RemotePort *s, bool server)
     int r;
 
     prefix = rp_sanitize_prefix(s);
-    r = asprintf(&chardesc, "unix:%s/qemu-rport-%s,wait%s",
-                 machine_path, prefix, server ? ",server" : "");
+    r = asprintf(&chardesc, "unix:%s/qemu-rport-%s%s",
+                 machine_path, prefix, server ? ",wait,server" : "");
     assert(r > 0);
     free(prefix);
     return chardesc;
@@ -371,12 +374,12 @@ static Chardev *rp_autocreate_chardev(RemotePort *s, char *name)
     char *chardesc;
 
     chardesc = rp_autocreate_chardesc(s, false);
-    chr = qemu_chr_new_noreplay(name, chardesc);
+    chr = qemu_chr_new_noreplay(name, chardesc, false, NULL);
     free(chardesc);
 
     if (!chr) {
         chardesc = rp_autocreate_chardesc(s, true);
-        chr = qemu_chr_new_noreplay(name, chardesc);
+        chr = qemu_chr_new_noreplay(name, chardesc, false, NULL);
         free(chardesc);
     }
     return chr;
@@ -443,12 +446,11 @@ static void rp_event_read(void *opaque)
         r = read(s->event.pipe.read, buf, sizeof buf);
 #endif
         if (r == 0) {
-            hw_error("%s: pipe closed?\n", s->prefix);
+            return;
         }
     } while (r == sizeof buf || (r < 0 && errno == EINTR));
 
     rp_process(s);
-    rp_leave_iothread(s);
 }
 
 static void rp_event_notify(RemotePort *s)
@@ -590,12 +592,16 @@ static void rp_pt_process_pkt(RemotePort *s, RemotePortDynPkt *dpkt)
     }
 }
 
-static void rp_read_pkt(RemotePort *s, RemotePortDynPkt *dpkt)
+static int rp_read_pkt(RemotePort *s, RemotePortDynPkt *dpkt)
 {
     struct rp_pkt *pkt = dpkt->pkt;
     int used;
+    int r;
 
-    rp_recv(s, pkt, sizeof pkt->hdr);
+    r = rp_recv(s, pkt, sizeof pkt->hdr);
+    if (r <= 0) {
+        return r;
+    }
     used = rp_decode_hdr((void *) &pkt->hdr);
     assert(used == sizeof pkt->hdr);
 
@@ -603,15 +609,21 @@ static void rp_read_pkt(RemotePort *s, RemotePortDynPkt *dpkt)
         rp_dpkt_alloc(dpkt, sizeof pkt->hdr + pkt->hdr.len);
         /* pkt may move due to realloc.  */
         pkt = dpkt->pkt;
-        rp_recv(s, &pkt->hdr + 1, pkt->hdr.len);
+        r = rp_recv(s, &pkt->hdr + 1, pkt->hdr.len);
+        if (r <= 0) {
+            return r;
+        }
         rp_decode_payload(pkt);
     }
+
+    return used + r;
 }
 
 static void *rp_protocol_thread(void *arg)
 {
     RemotePort *s = REMOTE_PORT(arg);
     unsigned int i;
+    int r;
 
     /* Make sure we have a decent bufsize to start with.  */
     rp_dpkt_alloc(&s->rsp, sizeof s->rsp.pkt->busaccess + 1024);
@@ -630,12 +642,20 @@ static void *rp_protocol_thread(void *arg)
         wpos &= ARRAY_SIZE(s->rx_queue.pkt) - 1;
         dpkt = &s->rx_queue.pkt[wpos];
 
-        rp_read_pkt(s, dpkt);
+        r = rp_read_pkt(s, dpkt);
+        if (r <= 0) {
+            /* Disconnected.  */
+            break;
+        }
         if (0) {
             rp_pkt_dump("rport-pkt", (void *) dpkt->pkt,
                         sizeof dpkt->pkt->hdr + dpkt->pkt->hdr.len);
         }
         rp_pt_process_pkt(s, dpkt);
+    }
+
+    if (!s->finalizing) {
+        rp_fatal_error(s, "Disconnected");
     }
     return NULL;
 }
@@ -669,7 +689,7 @@ static void rp_realize(DeviceState *dev, Error **errp)
         if (chr) {
             /* Found the chardev via commandline */
         } else if (s->chardesc) {
-            chr = qemu_chr_new(name, s->chardesc);
+            chr = qemu_chr_new(name, s->chardesc, NULL);
         } else {
             if (!machine_path) {
                 error_report("%s: Missing chardesc prop."
@@ -688,6 +708,7 @@ static void rp_realize(DeviceState *dev, Error **errp)
         }
 
         qdev_prop_set_chr(dev, "chardev", chr);
+        s->chrdev = chr;
     }
 
     /* Force RP sockets into blocking mode since our RP-thread will deal
@@ -706,7 +727,7 @@ static void rp_realize(DeviceState *dev, Error **errp)
         int listen_sk;
 
         sock = socket_parse("127.0.0.1:0", &error_abort);
-        listen_sk = socket_listen(sock, &error_abort);
+        listen_sk = socket_listen(sock, 1, &error_abort);
 
         if (s->event.pipe.read < 0) {
             perror("socket read");
@@ -771,19 +792,42 @@ static void rp_realize(DeviceState *dev, Error **errp)
        change.  */
     s->sync.quantum = s->peer.local_cfg.quantum;
 
-    s->sync.bh = qemu_bh_new(sync_timer_hit, s);
-    s->sync.bh_resp = qemu_bh_new(syncresp_timer_hit, s);
-    s->sync.ptimer = ptimer_init(s->sync.bh, PTIMER_POLICY_DEFAULT);
-    s->sync.ptimer_resp = ptimer_init(s->sync.bh_resp, PTIMER_POLICY_DEFAULT);
+    s->sync.ptimer = ptimer_init(sync_timer_hit, s, PTIMER_POLICY_DEFAULT);
+    s->sync.ptimer_resp = ptimer_init(syncresp_timer_hit, s,
+                                      PTIMER_POLICY_DEFAULT);
 
     /* The Sync-quantum is expressed in nano-seconds.  */
+    ptimer_transaction_begin(s->sync.ptimer);
     ptimer_set_freq(s->sync.ptimer, 1000 * 1000 * 1000);
+    ptimer_transaction_commit(s->sync.ptimer);
+
+    ptimer_transaction_begin(s->sync.ptimer_resp);
     ptimer_set_freq(s->sync.ptimer_resp, 1000 * 1000 * 1000);
+    ptimer_transaction_commit(s->sync.ptimer_resp);
 
     qemu_sem_init(&s->rx_queue.sem, ARRAY_SIZE(s->rx_queue.pkt) - 1);
     qemu_thread_create(&s->thread, "remote-port", rp_protocol_thread, s,
                        QEMU_THREAD_JOINABLE);
+
     rp_restart_sync_timer(s);
+}
+
+static void rp_unrealize(DeviceState *dev)
+{
+    RemotePort *s = REMOTE_PORT(dev);
+
+    s->finalizing = true;
+
+    /* Unregister handler.  */
+    qemu_set_fd_handler(s->event.pipe.read, NULL, NULL, s);
+
+    info_report("%s: Wait for remote-port to disconnect\n", s->prefix);
+    qemu_chr_fe_disconnect(&s->chr);
+    qemu_thread_join(&s->thread);
+
+    close(s->event.pipe.read);
+    close(s->event.pipe.write);
+    object_unparent(OBJECT(s->chrdev));
 }
 
 static const VMStateDescription vmstate_rp = {
@@ -812,16 +856,12 @@ static void rp_init(Object *obj)
     int t;
     int i;
 
-    /* Disable icount IDLE time warping. remoteport will take care of it.  */
-    qemu_icount_enable_idle_timewarps(false);
-
     for (i = 0; i < REMOTE_PORT_MAX_DEVS; ++i) {
         char *name = g_strdup_printf("remote-port-dev%d", i);
         object_property_add_link(obj, name, TYPE_REMOTE_PORT_DEVICE,
                              (Object **)&s->devs[i],
                              qdev_prop_allow_set_link,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
         g_free(name);
 
 
@@ -844,8 +884,9 @@ static void rp_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = rp_realize;
+    dc->unrealize = rp_unrealize;
     dc->vmsd = &vmstate_rp;
-    dc->props = rp_properties;
+    device_class_set_props(dc, rp_properties);
 }
 
 static const TypeInfo rp_info = {

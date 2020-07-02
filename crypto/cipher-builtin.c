@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -74,7 +74,7 @@ static void qcrypto_cipher_free_aes(QCryptoCipher *cipher)
 }
 
 
-static void qcrypto_cipher_aes_ecb_encrypt(AES_KEY *key,
+static void qcrypto_cipher_aes_ecb_encrypt(const AES_KEY *key,
                                            const void *in,
                                            void *out,
                                            size_t len)
@@ -100,7 +100,7 @@ static void qcrypto_cipher_aes_ecb_encrypt(AES_KEY *key,
 }
 
 
-static void qcrypto_cipher_aes_ecb_decrypt(AES_KEY *key,
+static void qcrypto_cipher_aes_ecb_decrypt(const AES_KEY *key,
                                            const void *in,
                                            void *out,
                                            size_t len)
@@ -133,8 +133,7 @@ static void qcrypto_cipher_aes_xts_encrypt(const void *ctx,
 {
     const QCryptoCipherBuiltinAESContext *aesctx = ctx;
 
-    qcrypto_cipher_aes_ecb_encrypt((AES_KEY *)&aesctx->enc,
-                                   src, dst, length);
+    qcrypto_cipher_aes_ecb_encrypt(&aesctx->enc, src, dst, length);
 }
 
 
@@ -145,8 +144,7 @@ static void qcrypto_cipher_aes_xts_decrypt(const void *ctx,
 {
     const QCryptoCipherBuiltinAESContext *aesctx = ctx;
 
-    qcrypto_cipher_aes_ecb_decrypt((AES_KEY *)&aesctx->dec,
-                                   src, dst, length);
+    qcrypto_cipher_aes_ecb_decrypt(&aesctx->dec, src, dst, length);
 }
 
 

@@ -188,11 +188,20 @@ static void mpi_to_signed(gcry_mpi_t a, unsigned int bytelen)
     if (gcry_mpi_test_bit(a, s_bit)) {
         gcry_mpi_t tmp;
 
-        tmp = gcry_mpi_new(bytelen * 8);
+        /*
+         * Allocate an additional bit to workaround a bug in older
+         * libgcrypt (at least 1.5.2). They allocate new space on demand but
+         * seem to fail to zero it in certain cases. This of course leads
+         * to incorrect computations.
+         *
+         * This makes sure the space is pre-allocated and zeroed out.
+         */
+        tmp = gcry_mpi_new(s_bit + 2);
         gcry_mpi_set_ui(tmp, 0);
         gcry_mpi_set_bit(tmp, s_bit + 1);
 
         gcry_mpi_sub(a, a, tmp);
+        gcry_mpi_release(tmp);
     }
 }
 
@@ -207,6 +216,7 @@ static void mpi_to_unsigned(gcry_mpi_t a, unsigned int bytelen)
         gcry_mpi_set_ui(r, 0);
         gcry_mpi_set_bit(r, s_bit);
         gcry_mpi_add(a, r, a);
+        gcry_mpi_release(r);
     }
 }
 
@@ -412,7 +422,10 @@ done:
 
     gcry_mpi_release(a);
     gcry_mpi_release(b);
+    gcry_mpi_release(m2);
     gcry_mpi_release(r);
+    gcry_mpi_release(bit);
+    gcry_mpi_release(tmp);
     return ret;
 }
 
@@ -705,6 +718,7 @@ int rsa_do_exppre(IPCoresRSA *s, unsigned int bitlen,
     }
 
     gcry_mpi_release(m);
+    gcry_mpi_release(y);
     gcry_mpi_release(r);
 
     return rsa_do_exp(s, bitlen, digits);

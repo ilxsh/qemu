@@ -24,11 +24,11 @@ error() {
     echo "Alternatively you may disable automatic GIT submodule checkout"
     echo "with:"
     echo
-    echo " $ ./configure --disable-git-update'"
+    echo " $ ./configure --disable-git-update"
     echo
     echo "and then manually update submodules prior to running make, with:"
     echo
-    echo " $ scripts/git-sbumodule.sh update $modules"
+    echo " $ scripts/git-submodule.sh update $modules"
     echo
     exit 1
 }
@@ -59,10 +59,14 @@ status)
     fi
 
     test -f "$substat" || exit 1
-    CURSTATUS=`$GIT submodule status $modules`
-    OLDSTATUS=`cat $substat`
-    test "$CURSTATUS" = "$OLDSTATUS"
-    exit $?
+    for module in $modules; do
+        CURSTATUS=$($GIT submodule status $module)
+        OLDSTATUS=$(cat $substat | grep $module)
+        if test "$CURSTATUS" != "$OLDSTATUS"; then
+            exit 1
+        fi
+    done
+    exit 0
     ;;
 update)
     if test -z "$maybe_modules"

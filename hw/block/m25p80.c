@@ -22,25 +22,17 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/hw.h"
+#include "qemu/units.h"
 #include "sysemu/block-backend.h"
-#include "sysemu/blockdev.h"
+#include "hw/qdev-properties.h"
 #include "hw/ssi/ssi.h"
+#include "migration/vmstate.h"
 #include "qemu/bitops.h"
 #include "qemu/log.h"
+#include "qemu/module.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
-
-#ifndef M25P80_ERR_DEBUG
-#define M25P80_ERR_DEBUG 0
-#endif
-
-#define DB_PRINT_L(level, ...) do { \
-    if (M25P80_ERR_DEBUG > (level)) { \
-        fprintf(stderr,  ": %s: ", __func__); \
-        fprintf(stderr, ## __VA_ARGS__); \
-    } \
-} while (0);
+#include "trace.h"
 
 /* Fields for FlashPartInfo->flags */
 
@@ -328,6 +320,7 @@ static const FlashPartInfo known_devices[] = {
     { INFO("w25q80",      0xef5014,      0,  64 << 10,  16, ER_4K) },
     { INFO("w25q80bl",    0xef4014,      0,  64 << 10,  16, ER_4K) },
     { INFO("w25q256",     0xef4019,      0,  64 << 10, 512, ER_4K) },
+    { INFO("w25q512jv",   0xef4020,      0,  64 << 10, 1024, ER_4K) },
 };
 
 typedef enum {
@@ -427,9 +420,11 @@ typedef enum {
     MAN_WINBOND,
     MAN_SST,
     MAN_GENERIC,
+    MAN_MICRON_OCTAL,
 } Manufacturer;
 
 #define M25P80_INTERNAL_DATA_BUFFER_SZ 16
+#define MICRON_OCTAL_CFG_SIZE 256
 
 typedef struct Flash {
     SSISlave parent_obj;
@@ -452,6 +447,11 @@ typedef struct Flash {
     /* Configuration register for Macronix */
     uint32_t volatile_cfg;
     uint32_t enh_volatile_cfg;
+    /* micron octal cfg registers */
+    uint8_t *nonvolatile_cfg_large;
+    uint32_t nv_cfg_large_len;
+    uint8_t *nv_cfg_large_stage;
+    uint8_t *volatile_cfg_large;
     /* Spansion cfg registers. */
     uint8_t spansion_cr1nv;
     uint8_t spansion_cr2nv;
@@ -499,6 +499,8 @@ static inline Manufacturer get_man(Flash *s)
         return MAN_MACRONIX;
     case 0xBF:
         return MAN_SST;
+    case 0x2C:
+        return MAN_MICRON_OCTAL;
     default:
         return MAN_GENERIC;
     }
@@ -584,7 +586,8 @@ static void flash_erase(Flash *s, int offset, FlashCMD cmd)
         abort();
     }
 
-    DB_PRINT_L(0, "offset = %#x, len = %d\n", offset, len);
+    trace_m25p80_flash_erase(s, offset, len);
+
     if ((s->pi->flags & capa_to_assert) != capa_to_assert) {
         qemu_log_mask(LOG_GUEST_ERROR, "M25P80: %d erase size not supported by"
                       " device\n", len);
@@ -617,8 +620,7 @@ void flash_write8(Flash *s, uint32_t addr, uint8_t data)
     }
 
     if ((prev ^ data) & data) {
-        DB_PRINT_L(1, "programming zero to one! addr=%" PRIx32 "  %" PRIx8
-                   " -> %" PRIx8 "\n", addr, prev, data);
+        trace_m25p80_programming_zero_to_one(s, addr, prev, data);
     }
 
     if (s->pi->flags & EEPROM) {
@@ -677,6 +679,9 @@ static void complete_collecting_data(Flash *s)
 
     s->state = STATE_IDLE;
 
+    trace_m25p80_complete_collecting(s, s->cmd_in_progress, n, s->ear,
+                                     s->cur_addr);
+
     switch (s->cmd_in_progress) {
     case DPP:
     case QPP:
@@ -722,6 +727,7 @@ static void complete_collecting_data(Flash *s)
     case WRSR:
         switch (get_man(s)) {
         case MAN_SPANSION:
+        case MAN_WINBOND:
             s->quad_enable = !!(s->data[1] & 0x02);
             break;
         case MAN_MACRONIX:
@@ -741,11 +747,41 @@ static void complete_collecting_data(Flash *s)
     case EXTEND_ADDR_WRITE:
         s->ear = s->data[0];
         break;
+    case RNVCR:
+        g_assert(get_man(s) == MAN_MICRON_OCTAL);
+        s->data[0] = s->nonvolatile_cfg_large[s->cur_addr];
+        s->pos = 0;
+        s->len = 1;
+        s->state = STATE_READING_DATA;
+        s->data_read_loop = true;
+        break;
+    case RVCR:
+        g_assert(get_man(s) == MAN_MICRON_OCTAL);
+        s->data[0] = s->volatile_cfg_large[s->cur_addr];
+        s->pos = 0;
+        s->len = 1;
+        s->state = STATE_READING_DATA;
+        s->data_read_loop = true;
+        break;
     case WNVCR:
-        s->nonvolatile_cfg = s->data[0] | (s->data[1] << 8);
+        if (get_man(s) == MAN_MICRON_OCTAL) {
+            if (s->cur_addr <= 7) {
+                s->nonvolatile_cfg_large[s->cur_addr] =
+                                      s->data[get_addr_length(s)];
+            }
+        } else {
+            s->nonvolatile_cfg = s->data[0] | (s->data[1] << 8);
+        }
         break;
     case WVCR:
-        s->volatile_cfg = s->data[0];
+        if (get_man(s) == MAN_MICRON_OCTAL) {
+            if (s->cur_addr <= 7) {
+                s->volatile_cfg_large[s->cur_addr] =
+                                      s->data[get_addr_length(s)];
+            }
+        } else {
+            s->volatile_cfg = s->data[0];
+        }
         break;
     case WEVCR:
         s->enh_volatile_cfg = s->data[0];
@@ -845,11 +881,15 @@ static void reset_memory(Flash *s)
                 SPANSION_ADDR_LEN_LEN
                 );
         break;
+    case MAN_MICRON_OCTAL:
+        memcpy(s->volatile_cfg_large, s->nonvolatile_cfg_large,
+               MICRON_OCTAL_CFG_SIZE);
+        break;
     default:
         break;
     }
 
-    DB_PRINT_L(0, "Reset done.\n");
+    trace_m25p80_reset_done(s);
 }
 
 static void decode_fast_read_cmd(Flash *s)
@@ -875,6 +915,9 @@ static void decode_fast_read_cmd(Flash *s)
                                     SPANSION_DUMMY_CLK_POS,
                                     SPANSION_DUMMY_CLK_LEN
                                     );
+        break;
+    case MAN_MICRON_OCTAL:
+        s->needed_bytes += s->volatile_cfg_large[1];
         break;
     default:
         break;
@@ -965,9 +1008,10 @@ static void decode_qio_read_cmd(Flash *s)
 
 static void decode_new_cmd(Flash *s, uint32_t value)
 {
-    s->cmd_in_progress = value;
     int i;
-    DB_PRINT_L(0, "decoded new command:%x\n", value);
+
+    s->cmd_in_progress = value;
+    trace_m25p80_command_decoded(s, value);
 
     if (value != RESET_MEMORY) {
         s->reset_enable = false;
@@ -1029,6 +1073,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
     case WRSR:
         if (s->write_enable) {
             switch (get_man(s)) {
+            case MAN_WINBOND:
             case MAN_SPANSION:
                 s->needed_bytes = 2;
                 s->state = STATE_COLLECTING_DATA;
@@ -1075,12 +1120,15 @@ static void decode_new_cmd(Flash *s, uint32_t value)
         break;
 
     case JEDEC_READ:
-        DB_PRINT_L(0, "populated jedec code\n");
+        trace_m25p80_populated_jedec(s);
         for (i = 0; i < s->pi->id_len; i++) {
             s->data[i] = s->pi->id[i];
         }
+        for (; i < SPI_NOR_MAX_ID_LEN; i++) {
+            s->data[i] = 0;
+        }
 
-        s->len = s->pi->id_len;
+        s->len = SPI_NOR_MAX_ID_LEN;
         s->pos = 0;
         s->state = STATE_READING_DATA;
         break;
@@ -1096,7 +1144,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
     case BULK_ERASE_60:
     case BULK_ERASE:
         if (s->write_enable) {
-            DB_PRINT_L(0, "chip erase\n");
+            trace_m25p80_chip_erase(s);
             flash_erase(s, 0, BULK_ERASE);
         } else {
             qemu_log_mask(LOG_GUEST_ERROR, "M25P80: chip erase with write "
@@ -1128,29 +1176,52 @@ static void decode_new_cmd(Flash *s, uint32_t value)
         }
         break;
     case RNVCR:
-        s->data[0] = s->nonvolatile_cfg & 0xFF;
-        s->data[1] = (s->nonvolatile_cfg >> 8) & 0xFF;
+        if (get_man(s) == MAN_MICRON_OCTAL) {
+            s->needed_bytes = get_addr_length(s);
+            s->state = STATE_COLLECTING_DATA;
+            s->len = 0;
+        } else {
+            s->data[0] = s->nonvolatile_cfg & 0xFF;
+            s->data[1] = (s->nonvolatile_cfg >> 8) & 0xFF;
+            s->len = 2;
+            s->state = STATE_READING_DATA;
+        }
         s->pos = 0;
-        s->len = 2;
-        s->state = STATE_READING_DATA;
         break;
     case WNVCR:
-        if (s->write_enable && get_man(s) == MAN_NUMONYX) {
-            s->needed_bytes = 2;
-            s->pos = 0;
-            s->len = 0;
-            s->state = STATE_COLLECTING_DATA;
+        if (s->write_enable) {
+            if (get_man(s) == MAN_NUMONYX) {
+                s->needed_bytes = 2;
+                s->pos = 0;
+                s->len = 0;
+                s->state = STATE_COLLECTING_DATA;
+            } else if (get_man(s) == MAN_MICRON_OCTAL) {
+                s->needed_bytes = 1;
+                s->needed_bytes += get_addr_length(s);
+                s->pos = 0;
+                s->len = 0;
+                s->state = STATE_COLLECTING_DATA;
+            }
         }
         break;
     case RVCR:
-        s->data[0] = s->volatile_cfg & 0xFF;
+        if (get_man(s) == MAN_MICRON_OCTAL) {
+            s->needed_bytes = get_addr_length(s);
+            s->state = STATE_COLLECTING_DATA;
+            s->len = 0;
+        } else {
+            s->data[0] = s->volatile_cfg & 0xFF;
+            s->state = STATE_READING_DATA;
+            s->len = 1;
+        }
         s->pos = 0;
-        s->len = 1;
-        s->state = STATE_READING_DATA;
         break;
     case WVCR:
         if (s->write_enable) {
             s->needed_bytes = 1;
+            if (get_man(s) == MAN_MICRON_OCTAL) {
+                s->needed_bytes += get_addr_length(s);
+            }
             s->pos = 0;
             s->len = 0;
             s->state = STATE_COLLECTING_DATA;
@@ -1180,6 +1251,7 @@ static void decode_new_cmd(Flash *s, uint32_t value)
         break;
     case RDCR_EQIO:
         switch (get_man(s)) {
+        case MAN_WINBOND:
         case MAN_SPANSION:
             s->data[0] = (!!s->quad_enable) << 1;
             s->pos = 0;
@@ -1197,6 +1269,11 @@ static void decode_new_cmd(Flash *s, uint32_t value)
         s->quad_enable = false;
         break;
     default:
+        s->pos = 0;
+        s->len = 1;
+        s->state = STATE_READING_DATA;
+        s->data_read_loop = true;
+        s->data[0] = 0;
         qemu_log_mask(LOG_GUEST_ERROR, "M25P80: Unknown cmd %x\n", value);
         break;
     }
@@ -1217,7 +1294,7 @@ static int m25p80_cs(SSISlave *ss, bool select)
         s->data_read_loop = false;
     }
 
-    DB_PRINT_L(0, "%sselect\n", select ? "de" : "");
+    trace_m25p80_select(s, select ? "de" : "");
 
     return 0;
 }
@@ -1227,19 +1304,20 @@ static uint32_t m25p80_transfer8(SSISlave *ss, uint32_t tx)
     Flash *s = M25P80(ss);
     uint32_t r = 0;
 
+    trace_m25p80_transfer(s, s->state, s->len, s->needed_bytes, s->pos,
+                          s->cur_addr, (uint8_t)tx);
+
     switch (s->state) {
 
     case STATE_PAGE_PROGRAM:
-        DB_PRINT_L(1, "page program cur_addr=%#" PRIx32 " data=%" PRIx8 "\n",
-                   s->cur_addr, (uint8_t)tx);
+        trace_m25p80_page_program(s, s->cur_addr, (uint8_t)tx);
         flash_write8(s, s->cur_addr, (uint8_t)tx);
         s->cur_addr = (s->cur_addr + 1) & (s->size - 1);
         break;
 
     case STATE_READ:
         r = s->storage[s->cur_addr];
-        DB_PRINT_L(1, "READ 0x%" PRIx32 "=%" PRIx8 "\n", s->cur_addr,
-                   (uint8_t)r);
+        trace_m25p80_read_byte(s, s->cur_addr, (uint8_t)r);
         s->cur_addr = (s->cur_addr + 1) & (s->size - 1);
         break;
 
@@ -1277,6 +1355,7 @@ static uint32_t m25p80_transfer8(SSISlave *ss, uint32_t tx)
         }
 
         r = s->data[s->pos];
+        trace_m25p80_read_data(s, s->pos, (uint8_t)r);
         s->pos++;
         if (s->pos == s->len) {
             s->pos = 0;
@@ -1295,6 +1374,15 @@ static uint32_t m25p80_transfer8(SSISlave *ss, uint32_t tx)
     return r;
 }
 
+static void m25p80_exit(Object *obj)
+{
+    Flash *s = M25P80(obj);
+
+    g_free(s->nonvolatile_cfg_large);
+    g_free(s->volatile_cfg_large);
+    g_free(s->nv_cfg_large_stage);
+}
+
 static void m25p80_realize(SSISlave *ss, Error **errp)
 {
     Flash *s = M25P80(ss);
@@ -1306,6 +1394,25 @@ static void m25p80_realize(SSISlave *ss, Error **errp)
     s->size = s->pi->sector_size * s->pi->n_sectors;
     s->dirty_page = -1;
 
+    if (get_man(s) == MAN_MICRON_OCTAL) {
+        s->nonvolatile_cfg_large = g_new(uint8_t, MICRON_OCTAL_CFG_SIZE);
+        memset(s->nonvolatile_cfg_large, 0xFF, MICRON_OCTAL_CFG_SIZE);
+        s->volatile_cfg_large = g_new0(uint8_t, MICRON_OCTAL_CFG_SIZE);
+        if (s->nv_cfg_large_len) {
+            if (s->nv_cfg_large_len <= MICRON_OCTAL_CFG_SIZE) {
+                memcpy(s->nonvolatile_cfg_large, s->nv_cfg_large_stage,
+                       s->nv_cfg_large_len);
+            } else {
+               error_setg(errp, "m25p80: ERROR: nv-cfg-large-len > %d",
+                          MICRON_OCTAL_CFG_SIZE);
+               return;
+            }
+        } else {
+            /* Set default values if not provided */
+            s->nonvolatile_cfg_large[1] = 0; /* dummy cycles for fast read */
+        }
+    }
+
     if (s->blk) {
         uint64_t perm = BLK_PERM_CONSISTENT_READ |
                         (blk_is_read_only(s->blk) ? 0 : BLK_PERM_WRITE);
@@ -1314,7 +1421,7 @@ static void m25p80_realize(SSISlave *ss, Error **errp)
             return;
         }
 
-        DB_PRINT_L(0, "Binding to IF_MTD drive\n");
+        trace_m25p80_binding(s);
         s->storage = blk_blockalign(s->blk, s->size);
         if (blk_pread(s->blk, 0, s->storage, s->size) != s->size) {
             fprintf(stderr, "failed to read the initial flash content");
@@ -1322,7 +1429,7 @@ static void m25p80_realize(SSISlave *ss, Error **errp)
         }
 
     } else {
-        DB_PRINT_L(0, "No BDRV - binding to RAM\n");
+        trace_m25p80_binding_no_bdrv(s);
         s->storage = blk_blockalign(NULL, s->size);
         memset(s->storage, 0xFF, s->size);
     }
@@ -1349,6 +1456,9 @@ static Property m25p80_properties[] = {
     DEFINE_PROP_UINT8("spansion-cr2nv", Flash, spansion_cr2nv, 0x8),
     DEFINE_PROP_UINT8("spansion-cr3nv", Flash, spansion_cr3nv, 0x2),
     DEFINE_PROP_UINT8("spansion-cr4nv", Flash, spansion_cr4nv, 0x10),
+    DEFINE_PROP_ARRAY("nv-cfg-large-stage", Flash, nv_cfg_large_len,
+                      nv_cfg_large_stage,
+                      qdev_prop_uint8, uint8_t),
     DEFINE_PROP_DRIVE("drive", Flash, blk),
     DEFINE_PROP_END_OF_LIST(),
 };
@@ -1368,6 +1478,13 @@ static bool m25p80_data_read_loop_needed(void *opaque)
     return s->data_read_loop;
 }
 
+static bool m25p80_cfg_large_needed(void *opaque)
+{
+    Flash *s = M25P80(opaque);
+
+    return get_man(s) == MAN_MICRON_OCTAL;
+}
+
 static const VMStateDescription vmstate_m25p80_data_read_loop = {
     .name = "m25p80/data_read_loop",
     .version_id = 1,
@@ -1375,6 +1492,22 @@ static const VMStateDescription vmstate_m25p80_data_read_loop = {
     .needed = m25p80_data_read_loop_needed,
     .fields = (VMStateField[]) {
         VMSTATE_BOOL(data_read_loop, Flash),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_m25p80_cfg_large = {
+    .name = "m25p80/cfg_large",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = m25p80_cfg_large_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_VARRAY_UINT32(volatile_cfg_large, Flash,
+                            nv_cfg_large_len, 0,
+                            vmstate_info_uint8, uint8_t),
+        VMSTATE_VARRAY_UINT32(nonvolatile_cfg_large, Flash,
+                            nv_cfg_large_len, 0,
+                            vmstate_info_uint8, uint8_t),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1409,6 +1542,7 @@ static const VMStateDescription vmstate_m25p80 = {
     },
     .subsections = (const VMStateDescription * []) {
         &vmstate_m25p80_data_read_loop,
+        &vmstate_m25p80_cfg_large,
         NULL
     }
 };
@@ -1424,7 +1558,7 @@ static void m25p80_class_init(ObjectClass *klass, void *data)
     k->set_cs = m25p80_cs;
     k->cs_polarity = SSI_CS_LOW;
     dc->vmsd = &vmstate_m25p80;
-    dc->props = m25p80_properties;
+    device_class_set_props(dc, m25p80_properties);
     dc->reset = m25p80_reset;
     mc->pi = data;
 }
@@ -1435,6 +1569,7 @@ static const TypeInfo m25p80_info = {
     .instance_size  = sizeof(Flash),
     .class_size     = sizeof(M25P80Class),
     .abstract       = true,
+    .instance_finalize = m25p80_exit,
 };
 
 static void m25p80_register_types(void)

@@ -36,7 +36,7 @@ case $line in
     drivers=${line#*=}
     echo "#define CONFIG_AUDIO_DRIVERS \\"
     for drv in $drivers; do
-      echo "    &${drv}_audio_driver,\\"
+      echo "    \"${drv}\",\\"
     done
     echo ""
     ;;
@@ -54,9 +54,11 @@ case $line in
     done
     echo "    NULL"
     ;;
- CONFIG_*='$(CONFIG_SOFTMMU)'|CONFIG_*=y) # configuration
+ CONFIG_*=y) # configuration
     name=${line%=*}
     echo "#define $name 1"
+    ;;
+ CONFIG_*=n) # configuration
     ;;
  CONFIG_*=*) # configuration
     name=${line%=*}

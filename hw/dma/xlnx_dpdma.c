@@ -23,8 +23,14 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu-common.h"
 #include "qemu/log.h"
+#include "qapi/error.h"
+#include "qemu/module.h"
 #include "hw/dma/xlnx_dpdma.h"
+#include "hw/irq.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
 
 #ifndef DEBUG_DPDMA
 #define DEBUG_DPDMA 0
@@ -34,7 +40,7 @@
     if (DEBUG_DPDMA) {                                                         \
         qemu_log("xlnx_dpdma: " fmt , ## __VA_ARGS__);                         \
     }                                                                          \
-} while (0);
+} while (0)
 
 /*
  * Registers offset for DPDMA.
@@ -585,8 +591,7 @@ static void xlnx_dpdma_init(Object *obj)
     object_property_add_link(obj, "dma", TYPE_MEMORY_REGION,
                              (Object **)&s->dma_mr,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static void xlnx_dpdma_reset(DeviceState *dev)

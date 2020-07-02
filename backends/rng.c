@@ -14,6 +14,7 @@
 #include "sysemu/rng.h"
 #include "qapi/error.h"
 #include "qapi/qmp/qerror.h"
+#include "qemu/module.h"
 #include "qom/object_interfaces.h"
 
 void rng_backend_request_entropy(RngBackend *s, size_t size,
@@ -107,8 +108,7 @@ static void rng_backend_init(Object *obj)
 
     object_property_add_bool(obj, "opened",
                              rng_backend_prop_get_opened,
-                             rng_backend_prop_set_opened,
-                             NULL);
+                             rng_backend_prop_set_opened);
 }
 
 static void rng_backend_finalize(Object *obj)

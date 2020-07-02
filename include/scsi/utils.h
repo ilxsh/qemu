@@ -1,5 +1,5 @@
 #ifndef SCSI_UTILS_H
-#define SCSI_UTILS_H 1
+#define SCSI_UTILS_H
 
 #ifdef CONFIG_LINUX
 #include <scsi/sg.h>
@@ -31,6 +31,9 @@ typedef struct SCSISense {
 } SCSISense;
 
 int scsi_build_sense(uint8_t *buf, SCSISense sense);
+SCSISense scsi_parse_sense_buf(const uint8_t *in_buf, int in_len);
+int scsi_build_sense_buf(uint8_t *buf, size_t max_size, SCSISense sense,
+                         bool fixed_sense);
 
 /*
  * Predefined sense codes
@@ -103,6 +106,7 @@ extern const struct SCSISense sense_code_SPACE_ALLOC_FAILED;
 
 int scsi_sense_to_errno(int key, int asc, int ascq);
 int scsi_sense_buf_to_errno(const uint8_t *sense, size_t sense_size);
+bool scsi_sense_buf_is_guest_recoverable(const uint8_t *sense, size_t sense_size);
 
 int scsi_convert_sense(uint8_t *in_buf, int in_len,
                        uint8_t *buf, int len, bool fixed);

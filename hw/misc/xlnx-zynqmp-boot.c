@@ -25,14 +25,16 @@
 
 #include "qemu/osdep.h"
 #include "hw/sysbus.h"
-#include "hw/register-dep.h"
 #include "hw/ptimer.h"
 #include "qemu/bitops.h"
 #include "qapi/error.h"
 #include "sysemu/dma.h"
 #include "qemu/log.h"
 #include "qemu/main-loop.h"
-#include "qom/cpu.h"
+#include "hw/core/cpu.h"
+#include "migration/vmstate.h"
+#include "hw/qdev-properties.h"
+#include "sysemu/reset.h"
 
 #include "hw/misc/xlnx-zynqmp-pmufw-cfg.h"
 
@@ -98,13 +100,14 @@ typedef struct ZynqMPBoot {
     MemoryRegion *dma_mr;
     AddressSpace *dma_as;
 
-    QEMUBH *bh;
     ptimer_state *ptimer;
 
     BootState state;
 
     /* ZynqMP Boot reset is active-low.  */
     bool n_reset;
+
+    bool boot_ready;
 
     struct {
         uint32_t cpu_num;
@@ -164,11 +167,16 @@ static void pm_ipi_send(ZynqMPBoot *s,
     boot_store32(s, IPI_BASEADDR + IPI_TRIG_OFFSET, IPI_PMU_PM_INT_MASK);
 }
 
+static void release_cpu_set_pc(CPUState *cpu, run_on_cpu_data arg)
+{
+    cpu_set_pc(cpu, arg.target_ptr);
+}
+
 static void release_cpu(ZynqMPBoot *s)
 {
     CPUState *cpu = qemu_get_cpu(s->cfg.cpu_num);
     CPUClass *cc = CPU_GET_CLASS(cpu);
-    uint64_t pc = 0;
+    vaddr pc = 0;
     uint32_t r;
 
     DB_PRINT("Starting CPU#%d release\n", s->cfg.cpu_num)
@@ -189,7 +197,7 @@ static void release_cpu(ZynqMPBoot *s)
     }
     if (cc->set_pc) {
         DB_PRINT("Setting CPU#%d PC to 0x%" PRIx64 "\n", s->cfg.cpu_num, pc)
-        cc->set_pc(cpu, pc);
+        run_on_cpu(cpu, release_cpu_set_pc, RUN_ON_CPU_TARGET_PTR(pc));
     }
 }
 
@@ -273,6 +281,7 @@ static void boot_sequence(void *opaque)
             release_cpu(s);
         }
         s->state = STATE_DONE;
+        s->boot_ready = false;
         break;
 
     case STATE_DONE:
@@ -288,12 +297,23 @@ static void irq_handler(void *opaque, int irq, int level)
     ZynqMPBoot *s = XILINX_ZYNQMP_BOOT(opaque);
 
     if (!s->n_reset && level) {
+        s->boot_ready = true;
+    }
+    s->n_reset = level;
+}
+
+static void zynqmp_boot_reset(void *opaque)
+{
+    ZynqMPBoot *s = XILINX_ZYNQMP_BOOT(opaque);
+
+    if (s->boot_ready) {
         /* Start the boot sequence.  */
         DB_PRINT("Starting the boot sequence\n");
         s->state = STATE_WAIT_PMUFW;
+        ptimer_transaction_begin(s->ptimer);
         boot_sequence(s);
+        ptimer_transaction_commit(s->ptimer);
     }
-    s->n_reset = level;
 }
 
 static void zynqmp_boot_realize(DeviceState *dev, Error **errp)
@@ -307,9 +327,17 @@ static void zynqmp_boot_realize(DeviceState *dev, Error **errp)
     s->dma_as = s->dma_mr ? address_space_init_shareable(s->dma_mr, NULL)
                           : &address_space_memory;
 
-    s->bh = qemu_bh_new(boot_sequence, s);
-    s->ptimer = ptimer_init(s->bh, PTIMER_POLICY_DEFAULT);
+    qemu_register_reset_loader(zynqmp_boot_reset, dev);
+
+    s->ptimer = ptimer_init(boot_sequence, s, PTIMER_POLICY_DEFAULT);
+    ptimer_transaction_begin(s->ptimer);
     ptimer_set_freq(s->ptimer, 1000000);
+    ptimer_transaction_commit(s->ptimer);
+}
+
+static void zynqmp_boot_unrealize(DeviceState *dev)
+{
+    qemu_unregister_reset_loader(zynqmp_boot_reset, dev);
 }
 
 static void zynqmp_boot_init(Object *obj)
@@ -320,8 +348,7 @@ static void zynqmp_boot_init(Object *obj)
     object_property_add_link(obj, "dma", TYPE_MEMORY_REGION,
                              (Object **)&s->dma_mr,
                              qdev_prop_allow_set_link_before_realize,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             &error_abort);
+                             OBJ_PROP_LINK_STRONG);
 }
 
 static Property zynqmp_boot_props[] = {
@@ -336,7 +363,8 @@ static void zynqmp_boot_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = zynqmp_boot_realize;
-    dc->props = zynqmp_boot_props;
+    device_class_set_props(dc, zynqmp_boot_props);
+    dc->unrealize = zynqmp_boot_unrealize;
 }
 
 static const TypeInfo zynqmp_boot_info = {
